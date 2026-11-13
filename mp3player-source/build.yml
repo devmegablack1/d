@@ -1,0 +1,28 @@
+name: Build NDS
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show repo files
+        run: ls -la
+      - name: Make sure libnds, maxmod and libfat are installed
+        run: dkp-pacman -S --noconfirm --needed nds-dev || true
+      - name: Show toolchain
+        run: |
+          ls "$DEVKITPRO" || true
+          ls "$DEVKITPRO/calico/bin" "$DEVKITPRO/calico/share" || true
+          ls "$DEVKITPRO/libnds" || true
+      - name: Fetch minimp3 (public domain)
+        run: curl -fsSL -o minimp3.h https://raw.githubusercontent.com/lieff/minimp3/master/minimp3.h
+      - name: Build
+        run: make
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mp3player-nds
+          path: mp3player.nds
