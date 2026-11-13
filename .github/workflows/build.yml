@@ -11,19 +11,22 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Show repo files
-        run: ls -la
+        run: find . -not -path './.git/*' -type f
 
       - name: Install libnds, maxmod, libfat
         run: dkp-pacman -S --noconfirm --needed nds-dev || true
-
-      - name: Fetch minimp3 (public domain)
-        run: curl -fsSL -o minimp3.h https://raw.githubusercontent.com/lieff/minimp3/master/minimp3.h
 
       - name: Build
         shell: bash
         run: |
           set -e
-          test -f main.c || { echo "main.c is missing from the repo"; exit 1; }
+          MAIN="$(find . -name main.c -not -path './.git/*' | head -1)"
+          test -n "$MAIN" || { echo "main.c is missing from the repo"; exit 1; }
+          cd "$(dirname "$MAIN")"
+          echo "Building in: $(pwd)"
+
+          curl -fsSL -o minimp3.h https://raw.githubusercontent.com/lieff/minimp3/master/minimp3.h
+
           LIBNDS="$DEVKITPRO/libnds"
           CALICO="$DEVKITPRO/calico"
 
@@ -53,7 +56,8 @@ jobs:
           else
             "$DEVKITPRO/tools/bin/ndstool" -c mp3player.nds -9 mp3player.elf -7 "$ARM7"
           fi
-          ls -l mp3player.nds
+          cp mp3player.nds "$GITHUB_WORKSPACE/mp3player.nds"
+          ls -l "$GITHUB_WORKSPACE/mp3player.nds"
 
       - uses: actions/upload-artifact@v4
         with:
