@@ -33,14 +33,22 @@ jobs:
           SPECS="ds_arm9.specs"
           if [ -f "$CALICO/share/ds9.specs" ]; then SPECS="$CALICO/share/ds9.specs"; fi
 
+          # Pick the ARM7 core that contains the most maxmod (audio) code
           ARM7=""
-          for f in "$CALICO/bin/ds7_maxmod.elf" "$LIBNDS/default.elf"; do
-            if [ -f "$f" ]; then ARM7="$f"; break; fi
+          BEST=-1
+          for name in maine ragdoll sphynx lykoi bobtail; do
+            f="$CALICO/bin/ds7_$name.elf"
+            [ -f "$f" ] || continue
+            n=$("$DEVKITARM/bin/arm-none-eabi-nm" "$f" 2>/dev/null | grep -ci ' mm' || true)
+            echo "ARM7 candidate $name: $n maxmod symbols"
+            if [ "$n" -gt "$BEST" ]; then BEST=$n; ARM7="$f"; fi
           done
+          if [ -z "$ARM7" ] && [ -f "$LIBNDS/default.elf" ]; then ARM7="$LIBNDS/default.elf"; fi
           if [ -z "$ARM7" ]; then
-            echo "No ARM7 binary found. Contents of calico/bin:"; ls "$CALICO/bin" || true
+            echo "No ARM7 binary found"; ls "$CALICO/bin" || true
             exit 1
           fi
+          echo "Using ARM7 core: $ARM7"
 
           "$DEVKITARM/bin/arm-none-eabi-gcc" -O2 -Wall -march=armv5te -mtune=arm946e-s \
             -fomit-frame-pointer -ffunction-sections -fdata-sections \
