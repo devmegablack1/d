@@ -9,19 +9,52 @@ jobs:
     container: devkitpro/devkitarm
     steps:
       - uses: actions/checkout@v4
+
       - name: Show repo files
         run: ls -la
-      - name: Make sure libnds, maxmod and libfat are installed
+
+      - name: Install libnds, maxmod, libfat
         run: dkp-pacman -S --noconfirm --needed nds-dev || true
-      - name: Show toolchain
-        run: |
-          ls "$DEVKITPRO" || true
-          ls "$DEVKITPRO/calico/bin" "$DEVKITPRO/calico/share" || true
-          ls "$DEVKITPRO/libnds" || true
+
       - name: Fetch minimp3 (public domain)
         run: curl -fsSL -o minimp3.h https://raw.githubusercontent.com/lieff/minimp3/master/minimp3.h
+
       - name: Build
-        run: make
+        shell: bash
+        run: |
+          set -e
+          test -f main.c || { echo "main.c is missing from the repo"; exit 1; }
+          LIBNDS="$DEVKITPRO/libnds"
+          CALICO="$DEVKITPRO/calico"
+
+          SPECS="ds_arm9.specs"
+          if [ -f "$CALICO/share/ds9.specs" ]; then SPECS="$CALICO/share/ds9.specs"; fi
+
+          ARM7=""
+          for f in "$CALICO/bin/ds7_maxmod.elf" "$LIBNDS/default.elf"; do
+            if [ -f "$f" ]; then ARM7="$f"; break; fi
+          done
+          if [ -z "$ARM7" ]; then
+            echo "No ARM7 binary found. Contents of calico/bin:"; ls "$CALICO/bin" || true
+            exit 1
+          fi
+
+          "$DEVKITARM/bin/arm-none-eabi-gcc" -O2 -Wall -march=armv5te -mtune=arm946e-s \
+            -fomit-frame-pointer -ffunction-sections -fdata-sections \
+            -mthumb -mthumb-interwork -D__NDS__ -DARM9 \
+            -I"$LIBNDS/include" -I"$CALICO/include" \
+            main.c -specs="$SPECS" -mthumb -mthumb-interwork -Wl,--gc-sections \
+            -L"$LIBNDS/lib" -L"$CALICO/lib" -lfat -lmm9 -lnds9 \
+            -o mp3player.elf
+
+          if [ -f icon.bmp ]; then
+            "$DEVKITPRO/tools/bin/ndstool" -c mp3player.nds -9 mp3player.elf -7 "$ARM7" \
+              -b icon.bmp "MP3 Player;Made by koi;"
+          else
+            "$DEVKITPRO/tools/bin/ndstool" -c mp3player.nds -9 mp3player.elf -7 "$ARM7"
+          fi
+          ls -l mp3player.nds
+
       - uses: actions/upload-artifact@v4
         with:
           name: mp3player-nds
