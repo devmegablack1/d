@@ -36,15 +36,11 @@ jobs:
           LIBNDS="$DEVKITPRO/libnds"
           CALICO="$DEVKITPRO/calico"
 
-          echo "--- maxmod header info ---"
-          H="$(find /opt/devkitpro -name maxmod9.h | head -1)"
-          echo "$H"
-          grep -n -A8 "mm_ds_system" "$H" | head -40 || true
-          ls "$LIBNDS/lib" "$CALICO/lib" || true
-          echo "--------------------------"
-
-          SPECS="ds_arm9.specs"
-          if [ -f "$CALICO/share/ds9.specs" ]; then SPECS="$CALICO/share/ds9.specs"; fi
+          echo "--- spec files found ---"
+          find /opt/devkitpro -name '*.specs' | sort
+          SPECS="$(find /opt/devkitpro -name ds9.specs | head -1)"
+          if [ -z "$SPECS" ]; then SPECS="ds9.specs"; fi
+          echo "Using specs: $SPECS"
 
           # Pick the ARM7 core that contains the most maxmod (audio) code
           ARM7=""
@@ -68,7 +64,8 @@ jobs:
             -mthumb -mthumb-interwork -D__NDS__ -DARM9 \
             -I"$LIBNDS/include" -I"$CALICO/include" \
             main.c -specs="$SPECS" -mthumb -mthumb-interwork -Wl,--gc-sections \
-            -L"$LIBNDS/lib" -L"$CALICO/lib" -lfat -lmm9 -lnds9 \
+            -L"$LIBNDS/lib" -L"$CALICO/lib" \
+            -Wl,--start-group -lfat -lmm9 -lnds9 -lcalico_ds9 -Wl,--end-group \
             -o mp3player.elf
 
           if [ -f icon.bmp ]; then
