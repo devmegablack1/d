@@ -20,29 +20,43 @@ jobs:
         shell: bash
         run: |
           set -e
-          MAIN="$(find . -name main.c -not -path './.git/*' | head -1)"
-          test -n "$MAIN" || { echo "main.c is missing from the repo"; exit 1; }
-          cd "$(dirname "$MAIN")"
-          echo "Building in: $(pwd)"
-
-          curl -fsSL -o minimp3.h https://raw.githubusercontent.com/lieff/minimp3/master/minimp3.h
-
-          # Fixes for libnds 2.x: 'fp' is a reserved type name, FIFO_MAXMOD is gone
-          sed -i -E 's/\bfp\b/mp3f/g' main.c
-          if ! grep -q '#ifdef FIFO_MAXMOD' main.c; then
-            sed -i 's|^    sys.fifo_channel = FIFO_MAXMOD;|#ifdef FIFO_MAXMOD\n    sys.fifo_channel = FIFO_MAXMOD;\n#endif|' main.c
-          fi
+          # Use the newest main.c (the one that uses the Helix decoder)
+          MAIN=""
+          for f in $(find . -name main.c -not -path './.git/*'); do
+            if grep -q 'mp3dec.h' "$f"; then MAIN="$f"; break; fi
+          done
+          test -n "$MAIN" || { echo "No updated main.c found (needs the one that includes mp3dec.h)"; exit 1; }
+          SRC="$(cd "$(dirname "$MAIN")" && pwd)"
+          ICON="$SRC/icon.bmp"
+          if [ ! -f "$ICON" ]; then ICON="$GITHUB_WORKSPACE/icon.bmp"; fi
+          echo "Source folder: $SRC"
+          echo "Icon: $ICON"
 
           LIBNDS="$DEVKITPRO/libnds"
           CALICO="$DEVKITPRO/calico"
+          CC="$DEVKITARM/bin/arm-none-eabi-gcc"
 
-          echo "--- spec files found ---"
-          find /opt/devkitpro -name '*.specs' | sort
+          # ---- Helix fixed-point MP3 decoder ----
+          HX=/tmp/helix
+          mkdir -p "$HX" /tmp/hobj
+          curl -fsSL https://github.com/ultraembedded/libhelix-mp3/archive/refs/heads/master.tar.gz \
+            | tar xz -C "$HX" --strip-components=1
+          echo "--- helix source files ---"
+          find "$HX" -name '*.[ch]' | sort
+          HINC="-I$HX -I$HX/pub -I$HX/real"
+          OBJS=""
+          for f in $(find "$HX" -name '*.c' -not -path '*testwrap*' -not -path '*docs*'); do
+            o="/tmp/hobj/$(basename "$f" .c).o"
+            "$CC" -O3 -marm -mthumb-interwork -march=armv5te -mtune=arm946e-s \
+              -DARM -w $HINC -c "$f" -o "$o"
+            OBJS="$OBJS $o"
+          done
+          echo "Helix objects:$OBJS"
+
+          # ---- start-up files and ARM7 core ----
           SPECS="$(find /opt/devkitpro -name ds9.specs | head -1)"
           if [ -z "$SPECS" ]; then SPECS="ds9.specs"; fi
-          echo "Using specs: $SPECS"
 
-          # Pick the ARM7 core that contains the most maxmod (audio) code
           ARM7=""
           BEST=-1
           for name in maine ragdoll sphynx lykoi bobtail; do
@@ -52,30 +66,26 @@ jobs:
             echo "ARM7 candidate $name: $n maxmod symbols"
             if [ "$n" -gt "$BEST" ]; then BEST=$n; ARM7="$f"; fi
           done
-          if [ -z "$ARM7" ] && [ -f "$LIBNDS/default.elf" ]; then ARM7="$LIBNDS/default.elf"; fi
-          if [ -z "$ARM7" ]; then
-            echo "No ARM7 binary found"; ls "$CALICO/bin" || true
-            exit 1
-          fi
+          test -n "$ARM7" || { echo "No ARM7 binary found"; exit 1; }
           echo "Using ARM7 core: $ARM7"
 
-          "$DEVKITARM/bin/arm-none-eabi-gcc" -O2 -Wall -march=armv5te -mtune=arm946e-s \
+          # ---- build the player ----
+          "$CC" -O2 -Wall -march=armv5te -mtune=arm946e-s \
             -fomit-frame-pointer -ffunction-sections -fdata-sections \
             -mthumb -mthumb-interwork -D__NDS__ -DARM9 \
-            -I"$LIBNDS/include" -I"$CALICO/include" \
-            main.c -specs="$SPECS" -mthumb -mthumb-interwork -Wl,--gc-sections \
+            -I"$LIBNDS/include" -I"$CALICO/include" -I"$HX/pub" \
+            "$SRC/main.c" $OBJS -specs="$SPECS" -mthumb -mthumb-interwork -Wl,--gc-sections \
             -L"$LIBNDS/lib" -L"$CALICO/lib" \
             -Wl,--start-group -lfat -lmm9 -lnds9 -lcalico_ds9 -Wl,--end-group \
             -o mp3player.elf
 
-          if [ -f icon.bmp ]; then
+          if [ -f "$ICON" ]; then
             "$DEVKITPRO/tools/bin/ndstool" -c mp3player.nds -9 mp3player.elf -7 "$ARM7" \
-              -b icon.bmp "MP3 Player;Made by koi;"
+              -b "$ICON" "MP3 Player;Made by koi;"
           else
             "$DEVKITPRO/tools/bin/ndstool" -c mp3player.nds -9 mp3player.elf -7 "$ARM7"
           fi
-          cp mp3player.nds "$GITHUB_WORKSPACE/mp3player.nds"
-          ls -l "$GITHUB_WORKSPACE/mp3player.nds"
+          ls -l mp3player.nds
 
       - uses: actions/upload-artifact@v4
         with:
