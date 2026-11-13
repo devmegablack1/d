@@ -9,7 +9,9 @@
 //   Y or Select    cycle loop mode: ALL -> ONE -> OFF
 //   Touch a song   on the bottom screen to play it
 //
-// Needs minimp3.h (CC0) in the same folder: https://github.com/lieff/minimp3
+// MP3 decoding uses the Helix fixed-point decoder (the DS has no FPU).
+// Decoding happens in the main loop into a ring buffer; the audio callback
+// only copies samples out of it, so it stays tiny and fast.
 
 #include <nds.h>
 #include <fat.h>
@@ -20,17 +22,18 @@
 #include <strings.h>
 #include <dirent.h>
 
-#define MINIMP3_IMPLEMENTATION
-#define MINIMP3_ONLY_MP3
-#include "minimp3.h"
+#include "mp3dec.h"
 
-#define MAX_FILES   256
-#define NAME_LEN    256
-#define IN_BUF_SIZE (16 * 1024)
-#define REFILL_AT   4096
-#define STREAM_LEN  4096
-#define LIST_ROWS   21
-#define BAR_WIDTH   28
+#define MAX_FILES    256
+#define NAME_LEN     256
+#define IN_BUF_SIZE  (16 * 1024)
+#define REFILL_AT    6144
+#define STREAM_LEN   8192
+#define RING_FRAMES  16384            // must be a power of two
+#define RING_MASK    (RING_FRAMES - 1)
+#define PUMP_FRAMES  3                // MP3 frames decoded per main-loop pass
+#define LIST_ROWS    21
+#define BAR_WIDTH    28
 
 enum { LOOP_NONE = 0, LOOP_ALL = 1, LOOP_ONE = 2 };
 
@@ -41,73 +44,124 @@ static char files[MAX_FILES][NAME_LEN];
 static int  nfiles = 0;
 static int  cur = 0;
 
-static FILE *fp = NULL;
-static mp3dec_t dec;
-static uint8_t inbuf[IN_BUF_SIZE];
-static int inlen = 0;
+static FILE *mp3f = NULL;
+static HMP3Decoder hdec = NULL;
+static unsigned char inbuf[IN_BUF_SIZE];
+static int inpos = 0, inend = 0;
 static int at_eof = 0;
 
-static short pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
-static int pcm_frames = 0;
+static short pcm[2304];               // one MP3 frame: 2 granules * 2 ch * 576
+static int pcm_frames = 0;            // sample frames in pcm[]
 static int pcm_pos = 0;
 static int channels = 2;
 static int hz = 44100;
-static int bitrate = 128;
+static int bitrate = 128000;
 static long file_size = 0, data_start = 0;
 static unsigned total_sec = 0;
+
+static short ring[RING_FRAMES * 2];   // stereo ring buffer
+static volatile unsigned wr = 0;      // written by the main loop only
+static volatile unsigned rd = 0;      // written by the audio callback only
+static volatile int decoder_done = 0;
 
 static volatile int track_ended = 0;
 static int stream_open = 0;
 static int playing = 0;
-static int paused = 0;
-static int loop_mode = LOOP_ALL;   // loop is on by default
-static unsigned long long samples_out = 0;
+static volatile int paused = 0;
+static int loop_mode = LOOP_ALL;      // loop is on by default
+static volatile unsigned long long samples_out = 0;
 
 static mm_stream stream;
 
 // ---------------------------------------------------------------- decoding
 
-static void refill(void)
-{
-    if (at_eof || inlen >= REFILL_AT) return;
-    size_t n = fread(inbuf + inlen, 1, IN_BUF_SIZE - inlen, fp);
-    if (n == 0) at_eof = 1;
-    inlen += (int)n;
-}
-
 // Decode the next MP3 frame into pcm[]. Returns 1 on success, 0 at end of file.
 static int decode_next(void)
 {
     for (;;) {
-        refill();
-        if (inlen == 0) return 0;
-
-        mp3dec_frame_info_t info;
-        int s = mp3dec_decode_frame(&dec, inbuf, inlen, pcm, &info);
-
-        if (info.frame_bytes > 0) {
-            memmove(inbuf, inbuf + info.frame_bytes, inlen - info.frame_bytes);
-            inlen -= info.frame_bytes;
-        } else {
-            if (at_eof) return 0;
-            if (inlen >= REFILL_AT) {           // junk: skip a byte and resync
-                memmove(inbuf, inbuf + 1, --inlen);
+        // top up the input buffer when it runs low
+        if (!at_eof && (inend - inpos) < REFILL_AT) {
+            if (inpos > 0) {
+                memmove(inbuf, inbuf + inpos, inend - inpos);
+                inend -= inpos;
+                inpos = 0;
             }
+            size_t n = fread(inbuf + inend, 1, IN_BUF_SIZE - inend, mp3f);
+            if (n == 0) at_eof = 1;
+            inend += (int)n;
+        }
+
+        int avail = inend - inpos;
+        if (avail < 4) {
+            if (at_eof) return 0;
             continue;
         }
 
-        if (s > 0) {
-            channels = info.channels;
-            hz = info.hz;
-            if (info.bitrate_kbps > 0) bitrate = info.bitrate_kbps;
-            pcm_frames = s;
-            pcm_pos = 0;
-            return 1;
+        int off = MP3FindSyncWord(inbuf + inpos, avail);
+        if (off < 0) {
+            // no sync word here: throw everything away except the last 3 bytes
+            inpos += avail - 3;
+            if (at_eof) return 0;
+            continue;
+        }
+        inpos += off;
+        avail -= off;
+
+        unsigned char *p = inbuf + inpos;
+        int left = avail;
+        int err = MP3Decode(hdec, &p, &left, pcm, 0);
+        int used = avail - left;
+
+        if (err == ERR_MP3_NONE) {
+            inpos += used;
+            MP3FrameInfo fi;
+            MP3GetLastFrameInfo(hdec, &fi);
+            if (fi.outputSamps > 0 && fi.nChans > 0) {
+                channels = fi.nChans;
+                if (fi.samprate > 0) hz = fi.samprate;
+                if (fi.bitrate > 0) bitrate = fi.bitrate;
+                pcm_frames = fi.outputSamps / fi.nChans;
+                pcm_pos = 0;
+                return 1;
+            }
+        } else if (err == ERR_MP3_INDATA_UNDERFLOW) {
+            if (at_eof) return 0;
+            if (avail >= REFILL_AT) inpos += 1;      // stuck on a bogus header
+        } else {
+            inpos += (used > 0) ? used : 1;          // damaged frame: skip it
         }
     }
 }
 
-// maxmod calls this (from mmStreamUpdate) whenever it needs more audio.
+// Main loop: keep the ring buffer topped up (a few frames per call).
+static void pump(void)
+{
+    if (!playing || decoder_done) return;
+
+    int decoded = 0;
+    for (;;) {
+        // move pending samples into the ring
+        while (pcm_pos < pcm_frames && (wr - rd) < RING_FRAMES) {
+            unsigned i = wr & RING_MASK;
+            if (channels == 2) {
+                ring[2 * i]     = pcm[2 * pcm_pos];
+                ring[2 * i + 1] = pcm[2 * pcm_pos + 1];
+            } else {
+                ring[2 * i] = ring[2 * i + 1] = pcm[pcm_pos];
+            }
+            pcm_pos++;
+            wr++;
+        }
+        if (pcm_pos < pcm_frames) return;            // ring is full
+        if (decoded >= PUMP_FRAMES) return;
+        if ((RING_FRAMES - (wr - rd)) < 1152) return; // no room for a frame yet
+
+        if (!decode_next()) { decoder_done = 1; return; }
+        decoded++;
+    }
+}
+
+// maxmod asks for audio here. Keep it tiny: just copy from the ring buffer.
 static mm_word stream_cb(mm_word length, mm_addr dest, mm_stream_formats format)
 {
     (void)format;
@@ -115,22 +169,19 @@ static mm_word stream_cb(mm_word length, mm_addr dest, mm_stream_formats format)
     mm_word done = 0;
 
     if (!paused) {
-        while (done < length) {
-            if (pcm_pos >= pcm_frames) {
-                if (!decode_next()) { track_ended = 1; break; }
-            }
-            while (done < length && pcm_pos < pcm_frames) {
-                if (channels == 2) {
-                    out[2 * done]     = pcm[2 * pcm_pos];
-                    out[2 * done + 1] = pcm[2 * pcm_pos + 1];
-                } else {
-                    out[2 * done] = out[2 * done + 1] = pcm[pcm_pos];
-                }
-                done++;
-                pcm_pos++;
-            }
+        unsigned avail = wr - rd;
+        unsigned r = rd;
+        while (done < length && avail > 0) {
+            unsigned i = r & RING_MASK;
+            out[2 * done]     = ring[2 * i];
+            out[2 * done + 1] = ring[2 * i + 1];
+            r++;
+            avail--;
+            done++;
         }
+        rd = r;
         samples_out += done;
+        if (done < length && decoder_done && wr == rd) track_ended = 1;
     }
 
     for (mm_word i = done; i < length; i++)
@@ -144,7 +195,8 @@ static mm_word stream_cb(mm_word length, mm_addr dest, mm_stream_formats format)
 static void close_track(void)
 {
     if (stream_open) { mmStreamClose(); stream_open = 0; }
-    if (fp) { fclose(fp); fp = NULL; }
+    if (mp3f) { fclose(mp3f); mp3f = NULL; }
+    if (hdec) { MP3FreeDecoder(hdec); hdec = NULL; }
     playing = 0;
 }
 
@@ -158,36 +210,44 @@ static int open_track(int index)
     snprintf(path, sizeof path, "%s%s%s", dirpath,
              (dl > 0 && dirpath[dl - 1] == '/') ? "" : "/", files[index]);
 
-    fp = fopen(path, "rb");
-    if (!fp) return 0;
+    mp3f = fopen(path, "rb");
+    if (!mp3f) return 0;
 
-    fseek(fp, 0, SEEK_END);
-    file_size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
+    fseek(mp3f, 0, SEEK_END);
+    file_size = ftell(mp3f);
+    fseek(mp3f, 0, SEEK_SET);
 
     // Skip an ID3v2 tag (embedded cover art can be huge)
-    uint8_t hdr[10];
+    unsigned char hdr[10];
     data_start = 0;
-    if (fread(hdr, 1, 10, fp) == 10 && memcmp(hdr, "ID3", 3) == 0) {
+    if (fread(hdr, 1, 10, mp3f) == 10 && memcmp(hdr, "ID3", 3) == 0) {
         data_start = 10 + (((hdr[6] & 0x7F) << 21) | ((hdr[7] & 0x7F) << 14) |
                            ((hdr[8] & 0x7F) << 7)  |  (hdr[9] & 0x7F));
     }
-    fseek(fp, data_start, SEEK_SET);
+    fseek(mp3f, data_start, SEEK_SET);
 
-    mp3dec_init(&dec);
-    inlen = 0;
+    hdec = MP3InitDecoder();
+    if (!hdec) { fclose(mp3f); mp3f = NULL; return 0; }
+
+    inpos = inend = 0;
     at_eof = 0;
     pcm_frames = pcm_pos = 0;
+    wr = rd = 0;
+    decoder_done = 0;
     track_ended = 0;
     samples_out = 0;
     paused = 0;
 
     // Decode one frame first so we know the sample rate and bitrate
-    if (!decode_next()) { fclose(fp); fp = NULL; return 0; }
+    if (!decode_next()) { close_track(); return 0; }
 
-    total_sec = bitrate > 0
-        ? (unsigned)(((file_size - data_start) * 8) / ((long)bitrate * 1000))
-        : 0;
+    int br = bitrate;
+    if (br < 1000) br *= 1000;
+    total_sec = (br > 0) ? (unsigned)(((file_size - data_start) * 8) / br) : 0;
+
+    // Pre-fill the ring buffer so playback starts cleanly
+    playing = 1;
+    for (int i = 0; i < 6; i++) pump();
 
     stream.sampling_rate = hz;
     stream.buffer_length = STREAM_LEN;
@@ -198,7 +258,6 @@ static int open_track(int index)
     mmStreamOpen(&stream);
 
     stream_open = 1;
-    playing = 1;
     cur = index;
     return 1;
 }
@@ -353,7 +412,9 @@ int main(int argc, char **argv)
 
     mm_ds_system sys;
     memset(&sys, 0, sizeof sys);
+#ifdef FIFO_MAXMOD
     sys.fifo_channel = FIFO_MAXMOD;
+#endif
     mmInit(&sys);
 
     strcpy(dirpath, "/");
@@ -372,13 +433,15 @@ int main(int argc, char **argv)
         scan_dir();
     }
 
+    redraw_all();                    // show the list before the first (slow) load
     if (nfiles > 0) open_track(0);   // start playing right away
     redraw_all();
 
     int frame = 0;
     while (pmMainLoop()) {
-        swiWaitForVBlank();
+        pump();
         mmStreamUpdate();
+        swiWaitForVBlank();
 
         scanKeys();
         u32 down = keysDown();
@@ -421,7 +484,7 @@ int main(int argc, char **argv)
 
         if (redraw) {
             redraw_all();
-        } else if (nfiles > 0 && (++frame % 30) == 0) {
+        } else if (nfiles > 0 && (++frame % 20) == 0) {
             draw_time();
         }
     }
