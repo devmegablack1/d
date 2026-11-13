@@ -43,12 +43,17 @@ jobs:
             | tar xz -C "$HX" --strip-components=1
           echo "--- helix source files ---"
           find "$HX" -name '*.[ch]' | sort
+          # Use Helix's portable C math path (ARM7DI) and fix its MULSHIFT32,
+          # which is missing the >>32 shift in this copy of the library.
+          sed -i 's/return x \* y;/return (int)(((long long)x * (long long)y) >> 32);/' "$HX/real/assembly.h"
+          echo "--- patched MULSHIFT32 ---"
+          grep -n -B2 -A2 'long long)x' "$HX/real/assembly.h" || true
           HINC="-I$HX -I$HX/pub -I$HX/real"
           OBJS=""
           for f in $(find "$HX" -name '*.c' -not -path '*testwrap*' -not -path '*docs*'); do
             o="/tmp/hobj/$(basename "$f" .c).o"
             "$CC" -O3 -marm -mthumb-interwork -march=armv5te -mtune=arm946e-s \
-              -DARM -w $HINC -c "$f" -o "$o"
+              -DARM -DARM7DI -w $HINC -c "$f" -o "$o"
             OBJS="$OBJS $o"
           done
           echo "Helix objects:$OBJS"
