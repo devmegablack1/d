@@ -27,8 +27,21 @@ jobs:
 
           curl -fsSL -o minimp3.h https://raw.githubusercontent.com/lieff/minimp3/master/minimp3.h
 
+          # Fixes for libnds 2.x: 'fp' is a reserved type name, FIFO_MAXMOD is gone
+          sed -i -E 's/\bfp\b/mp3f/g' main.c
+          if ! grep -q '#ifdef FIFO_MAXMOD' main.c; then
+            sed -i 's|^    sys.fifo_channel = FIFO_MAXMOD;|#ifdef FIFO_MAXMOD\n    sys.fifo_channel = FIFO_MAXMOD;\n#endif|' main.c
+          fi
+
           LIBNDS="$DEVKITPRO/libnds"
           CALICO="$DEVKITPRO/calico"
+
+          echo "--- maxmod header info ---"
+          H="$(find /opt/devkitpro -name maxmod9.h | head -1)"
+          echo "$H"
+          grep -n -A8 "mm_ds_system" "$H" | head -40 || true
+          ls "$LIBNDS/lib" "$CALICO/lib" || true
+          echo "--------------------------"
 
           SPECS="ds_arm9.specs"
           if [ -f "$CALICO/share/ds9.specs" ]; then SPECS="$CALICO/share/ds9.specs"; fi
