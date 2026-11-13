@@ -20,17 +20,132 @@ jobs:
         shell: bash
         run: |
           set -e
-          # Use the newest main.c (the one that uses the Helix decoder)
+
           MAIN=""
           for f in $(find . -name main.c -not -path './.git/*'); do
             if grep -q 'mp3dec.h' "$f"; then MAIN="$f"; break; fi
           done
-          test -n "$MAIN" || { echo "No updated main.c found (needs the one that includes mp3dec.h)"; exit 1; }
+
+          test -n "$MAIN" || {
+            echo "No updated main.c found"
+            exit 1
+          }
+
           SRC="$(cd "$(dirname "$MAIN")" && pwd)"
           ICON="$SRC/icon.bmp"
-          if [ ! -f "$ICON" ]; then ICON="$GITHUB_WORKSPACE/icon.bmp"; fi
+
+          if [ ! -f "$ICON" ]; then
+            ICON="$GITHUB_WORKSPACE/icon.bmp"
+          fi
+
           echo "Source folder: $SRC"
           echo "Icon: $ICON"
+
+          # ---- Convert icon to an 8-bit indexed BMP ----
+          if [ -f "$ICON" ]; then
+            python3 - "$ICON" /tmp/icon-indexed.bmp <<'PY'
+          import sys
+          import struct
+
+          src, dst = sys.argv[1:3]
+
+          with open(src, "rb") as f:
+              data = f.read()
+
+          if data[:2] != b"BM":
+              raise SystemExit("ERROR: icon is not a valid BMP")
+
+          offset = struct.unpack_from("<I", data, 10)[0]
+          dib = struct.unpack_from("<I", data, 14)[0]
+
+          if dib < 40:
+              raise SystemExit("ERROR: Unsupported BMP header")
+
+          width, height, planes, bpp, compression = struct.unpack_from(
+              "<iiHHI", data, 18
+          )
+
+          if compression != 0:
+              raise SystemExit("ERROR: Compressed BMP is not supported")
+
+          if bpp == 8:
+              colors = struct.unpack_from("<I", data, 46)[0]
+              if colors == 0:
+                  colors = 256
+              if offset < 54 + colors * 4:
+                  raise SystemExit("ERROR: BMP palette is missing")
+              with open(dst, "wb") as f:
+                  f.write(data)
+              print("Icon already has an indexed color palette.")
+              sys.exit(0)
+
+          if bpp not in (24, 32):
+              raise SystemExit("ERROR: Icon must be 24-bit, 32-bit or 8-bit BMP")
+
+          w = width
+          h = abs(height)
+          top_down = height < 0
+          bytes_per_pixel = bpp // 8
+          stride = ((w * bytes_per_pixel + 3) // 4) * 4
+
+          palette = bytearray()
+          for i in range(256):
+              r = ((i >> 5) & 7) * 255 // 7
+              g = ((i >> 2) & 7) * 255 // 7
+              b = (i & 3) * 255 // 3
+              palette.extend((b, g, r, 0))
+
+          rows = []
+          for y in range(h):
+              sy = y if top_down else h - 1 - y
+              start = offset + sy * stride
+              row = data[start:start + stride]
+              if len(row) < stride:
+                  raise SystemExit("ERROR: Invalid BMP pixel data")
+
+              indexed = bytearray()
+              for x in range(w):
+                  p = x * bytes_per_pixel
+                  b, g, r = row[p:p+3]
+                  index = ((r >> 5) << 5) | ((g >> 5) << 2) | (b >> 6)
+                  indexed.append(index)
+
+              rows.append(indexed)
+
+          out_stride = (w + 3) & ~3
+          pixels = bytearray()
+
+          for row in reversed(rows):
+              pixels.extend(row)
+              pixels.extend(b"\0" * (out_stride - w))
+
+          pixel_offset = 14 + 40 + 1024
+          file_size = pixel_offset + len(pixels)
+
+          header = struct.pack(
+              "<2sIHHI", b"BM", file_size, 0, 0, pixel_offset
+          )
+
+          info = struct.pack(
+              "<IiiHHIIiiII",
+              40, w, h, 1, 8, 0, len(pixels),
+              2835, 2835, 256, 256
+          )
+
+          with open(dst, "wb") as f:
+              f.write(header)
+              f.write(info)
+              f.write(palette)
+              f.write(pixels)
+
+          print("Successfully converted icon to 8-bit indexed BMP.")
+          PY
+
+            ICON="/tmp/icon-indexed.bmp"
+            echo "Using converted icon: $ICON"
+          else
+            echo "WARNING: No icon found."
+          fi
 
           LIBNDS="$DEVKITPRO/libnds"
           CALICO="$DEVKITPRO/calico"
@@ -39,23 +154,28 @@ jobs:
           # ---- Helix fixed-point MP3 decoder ----
           HX=/tmp/helix
           mkdir -p "$HX" /tmp/hobj
+
           curl -fsSL https://github.com/ultraembedded/libhelix-mp3/archive/refs/heads/master.tar.gz \
             | tar xz -C "$HX" --strip-components=1
+
           echo "--- helix source files ---"
           find "$HX" -name '*.[ch]' | sort
-          # Use Helix's portable C math path (ARM7DI) and fix its MULSHIFT32,
-          # which is missing the >>32 shift in this copy of the library.
+
           sed -i 's/return x \* y;/return (int)(((long long)x * (long long)y) >> 32);/' "$HX/real/assembly.h"
+
           echo "--- patched MULSHIFT32 ---"
           grep -n -B2 -A2 'long long)x' "$HX/real/assembly.h" || true
+
           HINC="-I$HX -I$HX/pub -I$HX/real"
           OBJS=""
+
           for f in $(find "$HX" -name '*.c' -not -path '*testwrap*' -not -path '*docs*'); do
             o="/tmp/hobj/$(basename "$f" .c).o"
             "$CC" -O3 -marm -mthumb-interwork -march=armv5te -mtune=arm946e-s \
               -DARM -DARM7DI -w $HINC -c "$f" -o "$o"
             OBJS="$OBJS $o"
           done
+
           echo "Helix objects:$OBJS"
 
           # ---- start-up files and ARM7 core ----
@@ -64,14 +184,24 @@ jobs:
 
           ARM7=""
           BEST=-1
+
           for name in maine ragdoll sphynx lykoi bobtail; do
             f="$CALICO/bin/ds7_$name.elf"
             [ -f "$f" ] || continue
             n=$("$DEVKITARM/bin/arm-none-eabi-nm" "$f" 2>/dev/null | grep -ci ' mm' || true)
             echo "ARM7 candidate $name: $n maxmod symbols"
-            if [ "$n" -gt "$BEST" ]; then BEST=$n; ARM7="$f"; fi
+
+            if [ "$n" -gt "$BEST" ]; then
+              BEST=$n
+              ARM7="$f"
+            fi
           done
-          test -n "$ARM7" || { echo "No ARM7 binary found"; exit 1; }
+
+          test -n "$ARM7" || {
+            echo "No ARM7 binary found"
+            exit 1
+          }
+
           echo "Using ARM7 core: $ARM7"
 
           # ---- build the player ----
@@ -84,13 +214,19 @@ jobs:
             -Wl,--start-group -lfat -lmm9 -lnds9 -lcalico_ds9 -Wl,--end-group \
             -o mp3player.elf
 
+          # ---- package Nintendo DS ROM ----
           if [ -f "$ICON" ]; then
-            "$DEVKITPRO/tools/bin/ndstool" -c mp3player.nds -9 mp3player.elf -7 "$ARM7" \
+            "$DEVKITPRO/tools/bin/ndstool" -c mp3player.nds \
+              -9 mp3player.elf \
+              -7 "$ARM7" \
               -b "$ICON" "MP3 Player;Made by koi;"
           else
-            "$DEVKITPRO/tools/bin/ndstool" -c mp3player.nds -9 mp3player.elf -7 "$ARM7"
+            "$DEVKITPRO/tools/bin/ndstool" -c mp3player.nds \
+              -9 mp3player.elf \
+              -7 "$ARM7"
           fi
-          ls -l mp3player.nds
+
+          ls -lh mp3player.nds
 
       - uses: actions/upload-artifact@v4
         with:
