@@ -21,10 +21,13 @@
 #include <string.h>
 #include <strings.h>
 #include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "mp3dec.h"
 
 #define MAX_FILES    256
+#define MAX_ALBUMS   128
 #define NAME_LEN     256
 #define IN_BUF_SIZE  (16 * 1024)
 #define REFILL_AT    6144
@@ -39,6 +42,17 @@ static char dirpath[NAME_LEN];
 static char files[MAX_FILES][NAME_LEN];
 static int  nfiles = 0;
 static int  cur = 0;
+
+static char playdir[NAME_LEN * 2];        // folder of the list that is playing
+static char albums[MAX_ALBUMS][NAME_LEN]; // sub-folders that contain .mp3 files
+static int  albcount[MAX_ALBUMS];
+static int  nalb = 0;
+static char rootf[MAX_FILES][NAME_LEN];   // loose songs in the main folder
+static int  nroot = 0;
+static char bfiles[MAX_FILES][NAME_LEN];  // songs of the album being browsed
+static int  nb = 0;
+static int  browse = -1;                  // library view: -1 = main, else album
+static int  play_album = -1;              // list that is playing (-1 = main)
 
 static FILE *mp3f = NULL;
 static HMP3Decoder hdec = NULL;
@@ -142,7 +156,7 @@ static int decode_next(void)
 // Main loop: keep the ring buffer topped up (a few frames per call).
 static void pump(void)
 {
-    if (!playing || decoder_done) return;
+    if (!playing || decoder_done || !mp3f || !hdec) return;
 
     int decoded = 0;
     for (;;) {
@@ -211,10 +225,10 @@ static int open_track(int index)
     close_track();
     if (nfiles == 0) return 0;
 
-    char path[NAME_LEN * 2];
-    size_t dl = strlen(dirpath);
-    snprintf(path, sizeof path, "%s%s%s", dirpath,
-             (dl > 0 && dirpath[dl - 1] == '/') ? "" : "/", files[index]);
+    char path[NAME_LEN * 3];
+    size_t dl = strlen(playdir);
+    snprintf(path, sizeof path, "%s%s%s", playdir,
+             (dl > 0 && playdir[dl - 1] == '/') ? "" : "/", files[index]);
 
     mp3f = fopen(path, "rb");
     if (!mp3f) return 0;
@@ -290,19 +304,109 @@ static int cmp_names(const void *a, const void *b)
     return strcasecmp((const char *)a, (const char *)b);
 }
 
-static void scan_dir(void)
+static void join_path(char *dst, size_t cap, const char *dir, const char *name)
 {
+    size_t dl = strlen(dir);
+    snprintf(dst, cap, "%s%s%s", dir, (dl > 0 && dir[dl - 1] == '/') ? "" : "/", name);
+}
+
+static int is_mp3_name(const char *n)
+{
+    size_t l = strlen(n);
+    return n[0] != '.' && l > 4 && l < NAME_LEN && strcasecmp(n + l - 4, ".mp3") == 0;
+}
+
+// Collect the .mp3 files of one folder, sorted. Returns how many.
+static int scan_mp3s(const char *dir, char (*out)[NAME_LEN], int max)
+{
+    int n = 0;
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && n < max) {
+        if (is_mp3_name(e->d_name)) strcpy(out[n++], e->d_name);
+    }
+    closedir(d);
+    qsort(out, n, NAME_LEN, cmp_names);
+    return n;
+}
+
+static int count_mp3s(const char *dir)
+{
+    int n = 0;
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) if (is_mp3_name(e->d_name)) n++;
+    closedir(d);
+    return n;
+}
+
+// Loose songs in the main folder + every sub-folder that holds songs.
+// A "folder" is any entry we can open as a directory and that has .mp3 files in it.
+static void scan_library(void)
+{
+    nalb = 0;
+    nroot = scan_mp3s(dirpath, rootf, MAX_FILES);
+
     DIR *d = opendir(dirpath);
     if (!d) return;
     struct dirent *e;
-    while ((e = readdir(d)) != NULL && nfiles < MAX_FILES) {
-        size_t n = strlen(e->d_name);
-        if (n > 4 && n < NAME_LEN && strcasecmp(e->d_name + n - 4, ".mp3") == 0) {
-            strcpy(files[nfiles++], e->d_name);
-        }
+    while ((e = readdir(d)) != NULL && nalb < MAX_ALBUMS) {
+        if (e->d_name[0] == '.' || strlen(e->d_name) >= NAME_LEN) continue;
+        if (is_mp3_name(e->d_name)) continue;
+        strcpy(albums[nalb], e->d_name);
+        albcount[nalb] = 0;
+        nalb++;
     }
     closedir(d);
-    qsort(files, nfiles, NAME_LEN, cmp_names);
+
+    // keep only the candidates that open as folders and contain songs
+    int k = 0;
+    for (int i = 0; i < nalb; i++) {
+        char p[NAME_LEN * 3];
+        join_path(p, sizeof p, dirpath, albums[i]);
+        int c = count_mp3s(p);
+        if (c > 0) {
+            if (k != i) strcpy(albums[k], albums[i]);
+            albcount[k] = c;
+            k++;
+        }
+    }
+    nalb = k;
+
+    // sort folders by name (small insertion sort)
+    for (int i = 1; i < nalb; i++) {
+        char tmp[NAME_LEN]; int tc = albcount[i];
+        strcpy(tmp, albums[i]);
+        int j = i - 1;
+        while (j >= 0 && strcasecmp(albums[j], tmp) > 0) {
+            strcpy(albums[j + 1], albums[j]);
+            albcount[j + 1] = albcount[j];
+            j--;
+        }
+        strcpy(albums[j + 1], tmp);
+        albcount[j + 1] = tc;
+    }
+}
+
+static void load_cover(void);     // defined in the UI part
+
+// Make the list that is currently shown the one that plays.
+static void use_browse_as_playlist(void)
+{
+    if (browse < 0) {
+        memcpy(files, rootf, (size_t)nroot * NAME_LEN);
+        nfiles = nroot;
+        strcpy(playdir, dirpath);
+    } else {
+        memcpy(files, bfiles, (size_t)nb * NAME_LEN);
+        nfiles = nb;
+        join_path(playdir, sizeof playdir, dirpath, albums[browse]);
+    }
+    play_album = browse;
+    cur = 0;
+    load_cover();                  // icon.png of this album (if any)
 }
 
 // ---------------------------------------------------------------- UI
@@ -313,8 +417,41 @@ static void scan_dir(void)
 #define SW 256
 #define SH 192
 
-static u16 *fbT = NULL;   // top screen framebuffer
-static u16 *fbB = NULL;   // bottom screen framebuffer
+// We draw into these buffers in main RAM and copy only the changed rows to
+// the screens right after VBlank. That way the display never shows a
+// half-drawn frame (no flicker / glitches) and drawing is much faster.
+static u16 bufT[SW * SH] __attribute__((aligned(4)));
+static u16 bufB[SW * SH] __attribute__((aligned(4)));
+static u16 *fbT = bufT;    // top screen back buffer
+static u16 *fbB = bufB;    // bottom screen back buffer
+static u16 *vramT = NULL;  // the real screens
+static u16 *vramB = NULL;
+static int dT0 = 0, dT1 = SH, dB0 = 0, dB1 = SH;   // changed rows [d0, d1)
+
+static inline void mark(u16 *fb, int y0, int y1)
+{
+    if (y0 < 0) y0 = 0;
+    if (y1 > SH) y1 = SH;
+    if (y0 >= y1) return;
+    if (fb == bufT) { if (y0 < dT0) dT0 = y0; if (y1 > dT1) dT1 = y1; }
+    else            { if (y0 < dB0) dB0 = y0; if (y1 > dB1) dB1 = y1; }
+}
+
+static void flush_one(const u16 *src, u16 *dst, int *d0, int *d1)
+{
+    if (*d0 >= *d1 || !dst) return;
+    const u32 *s = (const u32 *)(src + *d0 * SW);
+    u32 *d = (u32 *)(dst + *d0 * SW);
+    int n = (*d1 - *d0) * SW / 2;
+    while (n-- > 0) *d++ = *s++;     // 32-bit writes only (VRAM ignores 8-bit)
+    *d0 = SH; *d1 = 0;
+}
+
+static void flush_screens(void)
+{
+    flush_one(bufT, vramT, &dT0, &dT1);
+    flush_one(bufB, vramB, &dB0, &dB1);
+}
 
 #define RGB(r, g, b) ((u16)(0x8000 | ((r) >> 3) | (((g) >> 3) << 5) | (((b) >> 3) << 10)))
 
@@ -1717,7 +1854,7 @@ static u16 cov1[3], cov2[3];        // cover-art gradient colours
 
 static inline void putpx(u16 *fb, int x, int y, u16 c)
 {
-    if ((unsigned)x < SW && (unsigned)y < SH) fb[y * SW + x] = c;
+    if ((unsigned)x < SW && (unsigned)y < SH) { fb[y * SW + x] = c; mark(fb, y, y + 1); }
 }
 
 static void fill_rect(u16 *fb, int x, int y, int w, int h, u16 c)
@@ -1727,6 +1864,7 @@ static void fill_rect(u16 *fb, int x, int y, int w, int h, u16 c)
     if (y < 0) y = 0;
     if (x1 > SW) x1 = SW;
     if (y1 > SH) y1 = SH;
+    mark(fb, y, y1);
     for (int j = y; j < y1; j++) {
         u16 *p = fb + j * SW + x;
         for (int i = x; i < x1; i++) *p++ = c;
@@ -1871,6 +2009,7 @@ static int text_width(const Font *f, const char *s)
 static void draw_text(u16 *fb, const Font *f, int x, int y, const char *s, u16 col)
 {
     int ch;
+    mark(fb, y - 2, y + f->lh + 4);
     while ((ch = next_char(&s)) != 0) {
         const FGlyph *g = &f->g[glyph_index(ch)];
         const unsigned char *d = f->d + g->off;
@@ -1914,6 +2053,450 @@ static void draw_text_right(u16 *fb, const Font *f, int xr, int y, const char *s
     draw_text(fb, f, xr - text_width(f, s), y, s, col);
 }
 
+// ------------------------------------------------------------ album cover (icon.png)
+//
+// A small streaming PNG reader. It inflates the picture one row at a time and
+// averages it straight into a thumbnail (max 96x96), so even a big image
+// needs very little memory. Non-square pictures are centre-cropped.
+// Supported: all normal PNGs (grey, RGB, palette, with/without alpha, 1-16 bit)
+// except interlaced ones.
+
+#define COVER_MAX 96
+#define PNG_MAXW  4096
+
+static u16 cover_pix[COVER_MAX * COVER_MAX];
+static int cover_s = 0;                    // side of the loaded cover (0 = none)
+static const char *cover_err = NULL;       // why icon.png could not be used
+static int cover_avg[3];
+
+static u32 acc_r[COVER_MAX * COVER_MAX];
+static u32 acc_g[COVER_MAX * COVER_MAX];
+static u32 acc_b[COVER_MAX * COVER_MAX];
+static u16 acc_n[COVER_MAX * COVER_MAX];
+static u16 xmap[PNG_MAXW];
+
+static FILE *pf;
+static unsigned char pin[2048];
+static int pin_len, pin_pos;
+static unsigned idat_left;
+static int pfail, pdone;
+
+static unsigned png_w, png_h;
+static int png_ct, png_bd, png_ch, png_bpp, png_rowbytes;
+static unsigned char png_pal[256][3];
+static int png_y, png_cx0, png_cy0, png_sw, png_ts;
+
+static unsigned char rowA[PNG_MAXW * 8 + 8], rowB[PNG_MAXW * 8 + 8];
+static unsigned char *rowcur, *rowprev;
+static int rowfill, rowlen;
+
+static unsigned char win[32768];
+static unsigned wpos;
+static unsigned bbuf;
+static int bcnt;
+
+static void service_audio(void)
+{
+    pump();
+    mmStreamUpdate();
+}
+
+// next compressed byte; walks from one IDAT chunk to the next
+static int png_getb(void)
+{
+    for (;;) {
+        if (idat_left > 0) {
+            if (pin_pos >= pin_len) {
+                size_t want = idat_left < sizeof pin ? idat_left : sizeof pin;
+                pin_len = (int)fread(pin, 1, want, pf);
+                pin_pos = 0;
+                if (pin_len <= 0) { pfail = 1; return 0; }
+            }
+            idat_left--;
+            return pin[pin_pos++];
+        }
+        unsigned char h[12];                      // CRC, length, type
+        if (fread(h, 1, 12, pf) != 12 || memcmp(h + 8, "IDAT", 4) != 0) { pfail = 1; return 0; }
+        idat_left = ((unsigned)h[4] << 24) | ((unsigned)h[5] << 16) | ((unsigned)h[6] << 8) | h[7];
+        pin_len = pin_pos = 0;
+    }
+}
+
+static inline int getbit(void)
+{
+    if (bcnt == 0) { bbuf = (unsigned)png_getb(); bcnt = 8; }
+    int b = (int)(bbuf & 1);
+    bbuf >>= 1;
+    bcnt--;
+    return b;
+}
+
+static int getbits(int n)
+{
+    int v = 0;
+    for (int i = 0; i < n; i++) v |= getbit() << i;
+    return v;
+}
+
+// ---- colour conversion of one decoded row into the thumbnail accumulators
+static inline void png_px(const unsigned char *row, int x, int *r, int *g, int *b, int *a)
+{
+    *a = 255;
+    int s = png_bd >= 8 ? png_bd / 8 : 1;
+    switch (png_ct) {
+    case 6: { int o = x * 4 * s; *r = row[o]; *g = row[o + s]; *b = row[o + 2 * s]; *a = row[o + 3 * s]; break; }
+    case 2: { int o = x * 3 * s; *r = row[o]; *g = row[o + s]; *b = row[o + 2 * s]; break; }
+    case 4: { int o = x * 2 * s; *r = *g = *b = row[o]; *a = row[o + s]; break; }
+    case 0: {
+        int v;
+        if (png_bd >= 8) v = row[x * s];
+        else {
+            int bp = x * png_bd, sh = 8 - png_bd - (bp & 7);
+            v = (row[bp >> 3] >> sh) & ((1 << png_bd) - 1);
+            v = v * 255 / ((1 << png_bd) - 1);
+        }
+        *r = *g = *b = v;
+        break; }
+    default: {
+        int v;
+        if (png_bd == 8) v = row[x];
+        else {
+            int bp = x * png_bd, sh = 8 - png_bd - (bp & 7);
+            v = (row[bp >> 3] >> sh) & ((1 << png_bd) - 1);
+        }
+        *r = png_pal[v][0]; *g = png_pal[v][1]; *b = png_pal[v][2];
+        break; }
+    }
+}
+
+static void row_done(void)
+{
+    unsigned char *cur = rowcur + 1, *prv = rowprev + 1;
+    int ft = rowcur[0], n = png_rowbytes, bpp = png_bpp;
+    switch (ft) {
+    case 0: break;
+    case 1: for (int i = bpp; i < n; i++) cur[i] = (unsigned char)(cur[i] + cur[i - bpp]); break;
+    case 2: for (int i = 0; i < n; i++) cur[i] = (unsigned char)(cur[i] + prv[i]); break;
+    case 3:
+        for (int i = 0; i < n; i++) {
+            int a = i >= bpp ? cur[i - bpp] : 0;
+            cur[i] = (unsigned char)(cur[i] + ((a + prv[i]) >> 1));
+        }
+        break;
+    case 4:
+        for (int i = 0; i < n; i++) {
+            int a = i >= bpp ? cur[i - bpp] : 0, b = prv[i], c = i >= bpp ? prv[i - bpp] : 0;
+            int p = a + b - c;
+            int pa = p > a ? p - a : a - p, pb = p > b ? p - b : b - p, pc = p > c ? p - c : c - p;
+            int pr = (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
+            cur[i] = (unsigned char)(cur[i] + pr);
+        }
+        break;
+    default: pfail = 1; return;
+    }
+
+    int y = png_y;
+    if (y >= png_cy0 && y < png_cy0 + png_sw) {
+        int ty = (y - png_cy0) * png_ts / png_sw;
+        int fast = (png_bd == 8 && (png_ct == 2 || png_ct == 6));
+        int st = png_ct == 6 ? 4 : 3;
+        const unsigned char *rp = cur + png_cx0 * st;
+        for (int k = 0; k < png_sw; k++) {
+            int r, g, b, a;
+            if (fast) {
+                r = rp[0]; g = rp[1]; b = rp[2]; a = (st == 4) ? rp[3] : 255;
+                rp += st;
+            } else {
+                png_px(cur, png_cx0 + k, &r, &g, &b, &a);
+            }
+            if (a < 255) {                        // blend transparency over dark grey
+                r = (r * a + 18 * (255 - a)) / 255;
+                g = (g * a + 18 * (255 - a)) / 255;
+                b = (b * a + 18 * (255 - a)) / 255;
+            }
+            int idx = ty * png_ts + xmap[k];
+            acc_r[idx] += (u32)r; acc_g[idx] += (u32)g; acc_b[idx] += (u32)b; acc_n[idx]++;
+        }
+    }
+
+    unsigned char *t = rowcur; rowcur = rowprev; rowprev = t;
+    rowfill = 0;
+    png_y++;
+    if (png_y >= (int)png_h) pdone = 1;
+    if ((png_y & 15) == 0) service_audio();       // keep the music going while loading
+}
+
+static inline void emit(unsigned char c)
+{
+    win[wpos & 32767] = c;
+    wpos++;
+    if (pdone) return;
+    rowcur[rowfill++] = c;
+    if (rowfill == rowlen) row_done();
+}
+
+// ---- inflate (the classic canonical-Huffman method)
+typedef struct { short count[16]; short symbol[288]; } Huff;
+static Huff h_len, h_dist, h_fixlen, h_fixdist;
+static int fixed_ready;
+
+static int huff_build(Huff *h, const short *length, int n)
+{
+    short offs[16];
+    for (int len = 0; len <= 15; len++) h->count[len] = 0;
+    for (int sym = 0; sym < n; sym++) h->count[length[sym]]++;
+    if (h->count[0] == n) return 0;
+    int left = 1;
+    for (int len = 1; len <= 15; len++) {
+        left <<= 1;
+        left -= h->count[len];
+        if (left < 0) return left;
+    }
+    offs[1] = 0;
+    for (int len = 1; len < 15; len++) offs[len + 1] = (short)(offs[len] + h->count[len]);
+    for (int sym = 0; sym < n; sym++)
+        if (length[sym] != 0) h->symbol[offs[length[sym]]++] = (short)sym;
+    return left;
+}
+
+static int huff_decode(const Huff *h)
+{
+    int code = 0, first = 0, index = 0;
+    for (int len = 1; len <= 15; len++) {
+        code |= getbit();
+        int count = h->count[len];
+        if (code - count < first) return h->symbol[index + (code - first)];
+        index += count;
+        first += count;
+        first <<= 1;
+        code <<= 1;
+    }
+    return -10;
+}
+
+static const short lbase[29] = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
+static const short lext[29]  = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
+static const short dbase[30] = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
+static const short dext[30]  = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
+
+static int inflate_codes(const Huff *lc, const Huff *dc)
+{
+    for (;;) {
+        if (pdone) return 0;
+        if (pfail) return -1;
+        int sym = huff_decode(lc);
+        if (sym < 0) return sym;
+        if (sym < 256) {
+            emit((unsigned char)sym);
+        } else if (sym == 256) {
+            return 0;
+        } else {
+            sym -= 257;
+            if (sym >= 29) return -10;
+            int len = lbase[sym] + getbits(lext[sym]);
+            sym = huff_decode(dc);
+            if (sym < 0 || sym >= 30) return -11;
+            unsigned dist = (unsigned)(dbase[sym] + getbits(dext[sym]));
+            if (dist > wpos) return -12;
+            while (len-- > 0) emit(win[(wpos - dist) & 32767]);
+        }
+    }
+}
+
+static int inflate_stored(void)
+{
+    bcnt = 0;
+    int len = png_getb(); len |= png_getb() << 8;
+    int nlen = png_getb(); nlen |= png_getb() << 8;
+    if (len != (~nlen & 0xFFFF)) return -2;
+    while (len-- > 0 && !pfail && !pdone) emit((unsigned char)png_getb());
+    return 0;
+}
+
+static int inflate_dynamic(void)
+{
+    static const unsigned char order[19] = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
+    short lengths[320];
+    int nlen = getbits(5) + 257, ndist = getbits(5) + 1, ncode = getbits(4) + 4;
+    if (nlen > 286 || ndist > 30) return -3;
+    int idx;
+    for (idx = 0; idx < ncode; idx++) lengths[order[idx]] = (short)getbits(3);
+    for (; idx < 19; idx++) lengths[order[idx]] = 0;
+
+    Huff hc;
+    if (huff_build(&hc, lengths, 19) != 0) return -4;
+
+    idx = 0;
+    while (idx < nlen + ndist) {
+        int sym = huff_decode(&hc);
+        if (sym < 0) return sym;
+        if (pfail) return -1;
+        if (sym < 16) {
+            lengths[idx++] = (short)sym;
+        } else {
+            int len = 0, rep;
+            if (sym == 16) {
+                if (idx == 0) return -5;
+                len = lengths[idx - 1];
+                rep = 3 + getbits(2);
+            } else if (sym == 17) rep = 3 + getbits(3);
+            else rep = 11 + getbits(7);
+            if (idx + rep > nlen + ndist) return -6;
+            while (rep-- > 0) lengths[idx++] = (short)len;
+        }
+    }
+    if (lengths[256] == 0) return -7;
+    int err = huff_build(&h_len, lengths, nlen);
+    if (err < 0 || (err > 0 && nlen - h_len.count[0] != 1)) return -8;
+    err = huff_build(&h_dist, lengths + nlen, ndist);
+    if (err < 0 || (err > 0 && ndist - h_dist.count[0] != 1)) return -9;
+    return inflate_codes(&h_len, &h_dist);
+}
+
+static int png_inflate(void)
+{
+    int cmf = png_getb(), flg = png_getb();
+    if ((cmf & 15) != 8 || (flg & 0x20)) return -20;
+    bcnt = 0;
+    wpos = 0;
+    int last;
+    do {
+        last = getbits(1);
+        int type = getbits(2), err;
+        if (type == 0) err = inflate_stored();
+        else if (type == 1) {
+            if (!fixed_ready) {
+                short l[288];
+                for (int i = 0; i < 144; i++) l[i] = 8;
+                for (int i = 144; i < 256; i++) l[i] = 9;
+                for (int i = 256; i < 280; i++) l[i] = 7;
+                for (int i = 280; i < 288; i++) l[i] = 8;
+                huff_build(&h_fixlen, l, 288);
+                for (int i = 0; i < 30; i++) l[i] = 5;
+                huff_build(&h_fixdist, l, 30);
+                fixed_ready = 1;
+            }
+            err = inflate_codes(&h_fixlen, &h_fixdist);
+        }
+        else if (type == 2) err = inflate_dynamic();
+        else err = -21;
+        if (err) return err;
+        if (pfail) return -1;
+    } while (!last && !pdone);
+    return 0;
+}
+
+static unsigned be32(const unsigned char *p)
+{
+    return ((unsigned)p[0] << 24) | ((unsigned)p[1] << 16) | ((unsigned)p[2] << 8) | p[3];
+}
+
+// returns NULL on success, otherwise a short reason
+static const char *png_read(void)
+{
+    unsigned char sig[8];
+    if (fread(sig, 1, 8, pf) != 8 || memcmp(sig, "\x89PNG\r\n\x1a\n", 8) != 0) return "not a PNG";
+
+    int have_ihdr = 0;
+    memset(png_pal, 0, sizeof png_pal);
+    for (;;) {
+        unsigned char h[8];
+        if (fread(h, 1, 8, pf) != 8) return "bad PNG";
+        unsigned len = be32(h);
+        if (memcmp(h + 4, "IHDR", 4) == 0) {
+            unsigned char d[13];
+            if (len < 13 || fread(d, 1, 13, pf) != 13) return "bad PNG";
+            fseek(pf, (long)(len - 13 + 4), SEEK_CUR);
+            png_w = be32(d); png_h = be32(d + 4);
+            png_bd = d[8]; png_ct = d[9];
+            if (d[10] != 0 || d[11] != 0) return "bad PNG";
+            if (d[12] != 0) return "interlaced";
+            if (png_w == 0 || png_h == 0) return "bad PNG";
+            if (png_w > PNG_MAXW) return "too wide";
+            int ok = 0;
+            switch (png_ct) {
+                case 0: ok = (png_bd == 1 || png_bd == 2 || png_bd == 4 || png_bd == 8 || png_bd == 16); png_ch = 1; break;
+                case 2: ok = (png_bd == 8 || png_bd == 16); png_ch = 3; break;
+                case 3: ok = (png_bd == 1 || png_bd == 2 || png_bd == 4 || png_bd == 8); png_ch = 1; break;
+                case 4: ok = (png_bd == 8 || png_bd == 16); png_ch = 2; break;
+                case 6: ok = (png_bd == 8 || png_bd == 16); png_ch = 4; break;
+            }
+            if (!ok) return "bad PNG";
+            have_ihdr = 1;
+        } else if (memcmp(h + 4, "PLTE", 4) == 0) {
+            unsigned want = len < 768 ? len : 768;
+            unsigned char pl[768];
+            if (fread(pl, 1, want, pf) != want) return "bad PNG";
+            for (unsigned i = 0; i < want / 3; i++) {
+                png_pal[i][0] = pl[i * 3]; png_pal[i][1] = pl[i * 3 + 1]; png_pal[i][2] = pl[i * 3 + 2];
+            }
+            fseek(pf, (long)(len - want + 4), SEEK_CUR);
+        } else if (memcmp(h + 4, "IDAT", 4) == 0) {
+            if (!have_ihdr) return "bad PNG";
+            idat_left = len;
+            break;
+        } else if (memcmp(h + 4, "IEND", 4) == 0) {
+            return "bad PNG";
+        } else {
+            fseek(pf, (long)len + 4, SEEK_CUR);
+        }
+    }
+
+    png_bpp = (png_ch * png_bd + 7) / 8;
+    png_rowbytes = (int)((png_w * (unsigned)png_ch * (unsigned)png_bd + 7) / 8);
+    rowlen = png_rowbytes + 1;
+    png_sw = (int)(png_w < png_h ? png_w : png_h);
+    png_cx0 = (int)(png_w - (unsigned)png_sw) / 2;
+    png_cy0 = (int)(png_h - (unsigned)png_sw) / 2;
+    png_ts = png_sw < COVER_MAX ? png_sw : COVER_MAX;
+    for (int k = 0; k < png_sw; k++) xmap[k] = (u16)(k * png_ts / png_sw);
+
+    memset(acc_r, 0, sizeof acc_r); memset(acc_g, 0, sizeof acc_g);
+    memset(acc_b, 0, sizeof acc_b); memset(acc_n, 0, sizeof acc_n);
+    rowcur = rowA; rowprev = rowB;
+    memset(rowB, 0, sizeof rowB);
+    rowfill = 0; png_y = 0; pfail = pdone = 0; pin_len = pin_pos = 0;
+
+    int err = png_inflate();
+    if (err || !pdone) return "bad data";
+
+    unsigned long tr = 0, tg = 0, tb = 0;
+    int cells = png_ts * png_ts, cnt = 0;
+    u16 last = RGB(18, 18, 18);
+    for (int i = 0; i < cells; i++) {
+        if (acc_n[i]) {
+            int n = acc_n[i];
+            int r = (int)(acc_r[i] / (u32)n), g = (int)(acc_g[i] / (u32)n), b = (int)(acc_b[i] / (u32)n);
+            last = RGB(r, g, b);
+            tr += (unsigned long)r; tg += (unsigned long)g; tb += (unsigned long)b; cnt++;
+        }
+        cover_pix[i] = last;
+    }
+    if (cnt == 0) return "bad data";
+    cover_avg[0] = (int)(tr / (unsigned long)cnt);
+    cover_avg[1] = (int)(tg / (unsigned long)cnt);
+    cover_avg[2] = (int)(tb / (unsigned long)cnt);
+    cover_s = png_ts;
+    return NULL;
+}
+
+// Load "icon.png" from the folder of the playing album (if there is one).
+static void load_cover(void)
+{
+    cover_s = 0;
+    cover_err = NULL;
+    if (play_album < 0) return;
+
+    char path[NAME_LEN * 3];
+    join_path(path, sizeof path, playdir, "icon.png");
+    pf = fopen(path, "rb");
+    if (!pf) return;
+    cover_err = png_read();
+    fclose(pf);
+    pf = NULL;
+    if (cover_err) cover_s = 0;
+}
+
 // ------------------------------------------------------------ colours
 
 static void hsv(int h, int s, int v, u16 *out)       // h 0..359, s,v 0..255
@@ -1954,10 +2537,15 @@ static unsigned name_hash(const char *s)
 static void pick_colours(void)
 {
     static const u16 bg[3] = { 18, 18, 18 };
-    int hue = nfiles > 0 ? (int)(name_hash(files[cur]) % 360) : 150;
+    int hue = 150;
+    if (play_album >= 0) hue = (int)(name_hash(albums[play_album]) % 360);
+    else if (nfiles > 0) hue = (int)(name_hash(files[cur]) % 360);
     u16 base[3];
     hsv(hue, 160, 105, base);
     memcpy(top_base, base, sizeof base);
+    if (cover_s > 0 && play_album >= 0) {          // tint from the album picture
+        for (int i = 0; i < 3; i++) top_base[i] = (u16)(cover_avg[i] * 115 / 256);
+    }
     hsv(hue, 175, 235, cov1);
     hsv((hue + 55) % 360, 190, 170, cov2);
     (void)bg;
@@ -1989,9 +2577,19 @@ static void fmt_time(char *dst, unsigned sec)
     snprintf(dst, 12, "%u:%02u", sec / 60, sec % 60);
 }
 
+// rows in the library list: main view = folders then loose songs
+static int item_count(void) { return browse < 0 ? nalb + nroot : nb; }
+
+// list row of the song that is playing, or -1 if it is not in this view
+static int cur_item(void)
+{
+    if (nfiles == 0 || browse != play_album) return -1;
+    return cur + (browse < 0 ? nalb : 0);
+}
+
 static void clamp_view(void)
 {
-    int maxv = nfiles - ROWS_VIS;
+    int maxv = item_count() - ROWS_VIS;
     if (maxv < 0) maxv = 0;
     if (view_first > maxv) view_first = maxv;
     if (view_first < 0) view_first = 0;
@@ -1999,19 +2597,49 @@ static void clamp_view(void)
 
 static void center_view_on_current(void)
 {
-    view_first = cur - ROWS_VIS / 2;
+    int c = cur_item();
+    if (c < 0) return;
+    view_first = c - ROWS_VIS / 2;
     clamp_view();
+}
+
+static void enter_album(int i)
+{
+    char p[NAME_LEN * 3];
+    join_path(p, sizeof p, dirpath, albums[i]);
+    nb = scan_mp3s(p, bfiles, MAX_FILES);
+    browse = i;
+    view_first = 0;
+    center_view_on_current();
+}
+
+static void leave_album(void)
+{
+    int a = browse;
+    browse = -1;
+    view_first = a - ROWS_VIS / 2;
+    clamp_view();
+}
+
+// folder names: underscores to spaces
+static void album_label(char *dst, size_t cap, const char *src)
+{
+    strncpy(dst, src, cap - 1);
+    dst[cap - 1] = 0;
+    for (char *p = dst; *p; p++) if (*p == '_') *p = ' ';
 }
 
 // ------------------------------------------------------------ top screen
 
 static void draw_cover(u16 *fb, int x0, int y0, int s)
 {
-    // gradient square with rounded corners
+    int pic = (cover_s > 0 && play_album >= 0 && nfiles > 0);
     for (int j = 0; j < s; j++) {
         for (int i = 0; i < s; i++) {
-            int t = (i + j) * 256 / (2 * s);
-            putpx(fb, x0 + i, y0 + j, lerp3(cov1, cov2, t));
+            u16 c;
+            if (pic) c = cover_pix[(j * cover_s / s) * cover_s + (i * cover_s / s)];
+            else     c = lerp3(cov1, cov2, (i + j) * 256 / (2 * s));
+            putpx(fb, x0 + i, y0 + j, c);
         }
     }
     // round the corners by painting the screen background back
@@ -2025,9 +2653,11 @@ static void draw_cover(u16 *fb, int x0, int y0, int s)
             putpx(fb, x0 + s - 1 - i, y0 + s - 1 - k, top_bg(y0 + s - 1 - k));
         }
     }
-    // beamed music note, scaled for a 96px cover
+    if (pic) return;
+
+    // beamed music note on the generated cover
     u16 w = RGB(255, 255, 255);
-    int sc = s;                                   // base design is 96 wide
+    int sc = s;
     int h1x = x0 + sc * 30 / 96, h1y = y0 + sc * 68 / 96;
     int h2x = x0 + sc * 62 / 96, h2y = y0 + sc * 60 / 96;
     int hr  = sc * 10 / 96;
@@ -2068,7 +2698,13 @@ static void draw_progress(void)
     draw_text_right(fbT, &F_SM, bx + bw, 163, b, C_GREY);
 
     const char *st = !playing ? "Stopped" : paused ? "Paused" : "Playing";
-    draw_text(fbT, &F_SM, 16, 178, st, playing && !paused ? C_GREEN : C_DIM);
+    if (play_album >= 0 && cover_err) {
+        char msg[48];
+        snprintf(msg, sizeof msg, "icon.png: %s", cover_err);
+        draw_text(fbT, &F_SM, 16, 178, msg, C_DIM);
+    } else {
+        draw_text(fbT, &F_SM, 16, 178, st, playing && !paused ? C_GREEN : C_DIM);
+    }
     draw_text_right(fbT, &F_SB, 240, 178, "made by koi", C_GREEN);
 }
 
@@ -2078,11 +2714,18 @@ static void draw_top_full(void)
 
     if (nfiles == 0) {
         draw_cover(fbT, 80, 14, 96);
-        draw_text(fbT, &F_LG, 16, 120, "No songs found", C_WHITE);
-        char path[NAME_LEN];
-        fit_text(path, sizeof path, &F_SM, dirpath, 224);
-        draw_text(fbT, &F_SM, 16, 145, "Put .mp3 files in the same folder", C_GREY);
-        draw_text(fbT, &F_SM, 16, 158, path, C_DIM);
+        if (nalb + nroot > 0) {
+            draw_text(fbT, &F_LG, 16, 120, "Pick something to play", C_WHITE);
+            draw_text(fbT, &F_SM, 16, 145, "Tap a song or an album below", C_GREY);
+        } else {
+            draw_text(fbT, &F_LG, 16, 120, "No songs found", C_WHITE);
+            char path[NAME_LEN + 16], shown[NAME_LEN + 16];
+            snprintf(path, sizeof path, "Looking in: %s", dirpath);
+            fit_text(shown, sizeof shown, &F_SM, path, 224);
+            draw_text(fbT, &F_SM, 16, 141, "Put .mp3 files or folders next to this app.", C_GREY);
+            draw_text(fbT, &F_SM, 16, 154, shown, C_DIM);
+            draw_text(fbT, &F_SM, 16, 167, "Found: 0 songs, 0 folders", C_DIM);
+        }
         draw_text_right(fbT, &F_SB, 240, 178, "made by koi", C_GREEN);
         return;
     }
@@ -2094,9 +2737,16 @@ static void draw_top_full(void)
     fit_text(shown, sizeof shown, &F_LG, nm, 224);
     draw_text(fbT, &F_LG, 16, 114, shown, C_WHITE);
 
-    char sub[48];
-    snprintf(sub, sizeof sub, "Song %d of %d", cur + 1, nfiles);
-    draw_text(fbT, &F_MD, 16, 134, sub, C_GREY);
+    char sub[NAME_LEN + 32], subf[NAME_LEN + 36];
+    if (play_album >= 0) {
+        char an[NAME_LEN];
+        album_label(an, sizeof an, albums[play_album]);
+        snprintf(sub, sizeof sub, "%s - %d of %d", an, cur + 1, nfiles);
+    } else {
+        snprintf(sub, sizeof sub, "Song %d of %d", cur + 1, nfiles);
+    }
+    fit_text(subf, sizeof subf, &F_MD, sub, 224);
+    draw_text(fbT, &F_MD, 16, 134, subf, C_GREY);
 
     draw_progress();
 }
@@ -2118,33 +2768,62 @@ static void draw_eq(int x, int y, int active)
 
 static void eq_refresh(void)
 {
-    int slot = cur - view_first;
-    if (slot < 0 || slot >= ROWS_VIS) return;
+    int c = cur_item();
+    int slot = c - view_first;
+    if (c < 0 || slot < 0 || slot >= ROWS_VIS) return;
     int y = LIST_Y + slot * ROW_H + 6;
     fill_rect(fbB, 12, y, 14, 14, C_ROW);
     draw_eq(14, y, playing && !paused);
 }
 
+static void draw_folder(int x, int y, u16 c)
+{
+    fill_rect(fbB, x, y, 7, 4, c);
+    fill_rrect(fbB, x, y + 2, 17, 12, 2, c);
+}
+
 static void draw_row(int idx)
 {
     int slot = idx - view_first;
-    if (slot < 0 || slot >= ROWS_VIS) return;
+    if (slot < 0 || slot >= ROWS_VIS || idx >= item_count()) return;
     int y = LIST_Y + slot * ROW_H;
-    int sel = (idx == cur);
+    int folder = (browse < 0 && idx < nalb);
+    int si = browse < 0 ? idx - nalb : idx;             // song index in its list
+    int sel = !folder && nfiles > 0 && browse == play_album && si == cur;
 
     fill_rect(fbB, 0, y, SW, ROW_H, C_BG);
     if (sel) fill_rrect(fbB, 4, y + 1, 248, ROW_H - 2, 5, C_ROW);
+
+    char nm[NAME_LEN], shown[NAME_LEN + 4];
+    if (folder) {
+        int here = (play_album == idx);
+        if (here && cover_s > 0) {
+            for (int j = 0; j < 16; j++)
+                for (int i = 0; i < 16; i++)
+                    putpx(fbB, 11 + i, y + 4 + j, cover_pix[(j * cover_s / 16) * cover_s + (i * cover_s / 16)]);
+        } else {
+            draw_folder(11, y + 5, here ? C_GREEN : C_GREY);
+        }
+        album_label(nm, sizeof nm, albums[idx]);
+        fit_text(shown, sizeof shown, &F_MD, nm, 150);
+        draw_text(fbB, &F_MD, 38, y + 4, shown, here ? C_GREEN : C_WHITE);
+        char cnt[24];
+        snprintf(cnt, sizeof cnt, albcount[idx] == 1 ? "%d song" : "%d songs", albcount[idx]);
+        draw_text_right(fbB, &F_SM, 234, y + 6, cnt, C_DIM);
+        tri_right(fbB, 240, y + 8, 5, 9, C_DIM);
+        return;
+    }
 
     if (sel) {
         draw_eq(14, y + 6, playing && !paused);
     } else {
         char num[16];
-        snprintf(num, sizeof num, "%d", idx + 1);
+        snprintf(num, sizeof num, "%d", si + 1);
         draw_text_right(fbB, &F_SM, 26, y + 6, num, C_DIM);
     }
 
-    char nm[NAME_LEN], shown[NAME_LEN + 4];
-    clean_name(nm, sizeof nm, files[idx]);
+    char (*list)[NAME_LEN] = browse < 0 ? rootf : bfiles;
+    clean_name(nm, sizeof nm, list[si]);
     fit_text(shown, sizeof shown, &F_MD, nm, 206);
     draw_text(fbB, &F_MD, 38, y + 4, shown, sel ? C_GREEN : C_WHITE);
 }
@@ -2152,20 +2831,33 @@ static void draw_row(int idx)
 static void draw_list(void)
 {
     fill_rect(fbB, 0, 0, SW, PANEL_Y, C_BG);
-    draw_text(fbB, &F_LG, 10, 2, "Your Library", C_WHITE);
+    int n = item_count();
+
+    if (browse < 0) {
+        draw_text(fbB, &F_LG, 10, 2, "Your Library", C_WHITE);
+    } else {
+        tri_left(fbB, 10, 6, 9, 13, C_WHITE);
+        char nm[NAME_LEN], shown[NAME_LEN + 4];
+        album_label(nm, sizeof nm, albums[browse]);
+        fit_text(shown, sizeof shown, &F_LG, nm, 165);
+        draw_text(fbB, &F_LG, 26, 2, shown, C_WHITE);
+    }
 
     // scroll arrows
-    tri_up(fbB, 210, 8, 12, 7, nfiles > ROWS_VIS && view_first > 0 ? C_WHITE : C_TRACK);
-    tri_down(fbB, 234, 8, 12, 7,
-             nfiles > ROWS_VIS && view_first < nfiles - ROWS_VIS ? C_WHITE : C_TRACK);
+    tri_up(fbB, 210, 8, 12, 7, n > ROWS_VIS && view_first > 0 ? C_WHITE : C_TRACK);
+    tri_down(fbB, 234, 8, 12, 7, n > ROWS_VIS && view_first < n - ROWS_VIS ? C_WHITE : C_TRACK);
 
-    if (nfiles == 0) {
-        draw_text(fbB, &F_MD, 10, 50, "Nothing here yet.", C_GREY);
-        draw_text(fbB, &F_SM, 10, 68, "Copy .mp3 files next to this app.", C_DIM);
+    if (n == 0) {
+        if (browse < 0) {
+            draw_text(fbB, &F_MD, 10, 50, "Nothing here yet.", C_GREY);
+            draw_text(fbB, &F_SM, 10, 68, "Copy .mp3 files or folders next to this app.", C_DIM);
+        } else {
+            draw_text(fbB, &F_MD, 10, 50, "No songs in this album.", C_GREY);
+        }
         return;
     }
     for (int i = 0; i < ROWS_VIS; i++) {
-        if (view_first + i < nfiles) draw_row(view_first + i);
+        if (view_first + i < n) draw_row(view_first + i);
     }
 }
 
@@ -2227,8 +2919,8 @@ int main(int argc, char **argv)
     vramSetBankC(VRAM_C_SUB_BG);
     int bgT = bgInit(3, BgType_Bmp16, BgSize_B16_256x256, 0, 0);
     int bgB = bgInitSub(3, BgType_Bmp16, BgSize_B16_256x256, 0, 0);
-    fbT = (u16 *)bgGetGfxPtr(bgT);
-    fbB = (u16 *)bgGetGfxPtr(bgB);
+    vramT = (u16 *)bgGetGfxPtr(bgT);
+    vramB = (u16 *)bgGetGfxPtr(bgB);
 
     mm_ds_system sys;
     memset(&sys, 0, sizeof sys);
@@ -2250,53 +2942,78 @@ int main(int argc, char **argv)
                 }
             }
         }
-        scan_dir();
+        scan_library();
+        if (nroot + nalb == 0) {     // launcher gave no usable path: try the working folder
+            char cwd[NAME_LEN];
+            if (getcwd(cwd, sizeof cwd) && strcmp(cwd, dirpath) != 0) {
+                strcpy(dirpath, cwd);
+                scan_library();
+            }
+        }
     }
+    strcpy(playdir, dirpath);
 
     refresh_all();                   // show the library before the first (slow) load
-    if (nfiles > 0) open_track(0);   // start playing right away
+    flush_screens();
+    if (nroot > 0) {                 // start playing the loose songs right away
+        use_browse_as_playlist();
+        open_track(0);
+    }
     center_view_on_current();
     refresh_all();
+    flush_screens();
 
     while (pmMainLoop()) {
         pump();
         mmStreamUpdate();
         swiWaitForVBlank();
+        flush_screens();             // show what was drawn last frame, tear-free
         tick++;
 
         scanKeys();
         u32 down = keysDown();
-        int full = 0, ctrl = 0, listd = 0;
-        int prev_cur = cur;
+        int full = 0, ctrl = 0, listd = 0, recenter = 0;
 
         if (down & KEY_A) {
             if (!playing) open_track(cur);
             else paused = !paused;
             ctrl = 1; listd = 1;
         }
-        if (down & KEY_B)                { open_track(cur); full = 1; }
-        if (down & (KEY_R | KEY_RIGHT))  { next_track(+1);  full = 1; }
-        if (down & (KEY_L | KEY_LEFT))   { next_track(-1);  full = 1; }
+        if (down & KEY_B)                { open_track(cur); full = 1; recenter = 1; }
+        if (down & (KEY_R | KEY_RIGHT))  { next_track(+1);  full = 1; recenter = 1; }
+        if (down & (KEY_L | KEY_LEFT))   { next_track(-1);  full = 1; recenter = 1; }
         if (down & (KEY_Y | KEY_SELECT)) { loop_mode = (loop_mode + 1) % 3; ctrl = 1; }
         if (down & KEY_X)                { shuffle = !shuffle; ctrl = 1; }
         if (down & KEY_DOWN)             { view_first++; clamp_view(); listd = 1; }
         if (down & KEY_UP)               { view_first--; clamp_view(); listd = 1; }
+        if ((down & KEY_START) && browse >= 0) { leave_album(); listd = 1; }
 
-        if ((down & KEY_TOUCH) && nfiles > 0) {
+        if (down & KEY_TOUCH) {
             touchPosition t;
             touchRead(&t);
             int tx = t.px, ty = t.py;
 
             if (ty >= LIST_Y && ty < LIST_Y + ROWS_VIS * ROW_H) {
                 int idx = view_first + (ty - LIST_Y) / ROW_H;
-                if (idx >= 0 && idx < nfiles) {
-                    if (idx == cur && playing) paused = !paused;
-                    else open_track(idx);
-                    full = 1;
+                if (idx >= 0 && idx < item_count()) {
+                    if (browse < 0 && idx < nalb) {
+                        enter_album(idx);                     // open the folder
+                        listd = 1;
+                    } else {
+                        int si = browse < 0 ? idx - nalb : idx;
+                        if (nfiles > 0 && browse == play_album && si == cur && playing) {
+                            paused = !paused;                 // tap the playing song
+                        } else {
+                            if (browse != play_album || nfiles == 0) use_browse_as_playlist();
+                            open_track(si);
+                        }
+                        full = 1;
+                    }
                 }
             } else if (ty < LIST_Y) {
-                if (tx >= 200 && tx < 224) { view_first -= ROWS_VIS; clamp_view(); listd = 1; }
-                if (tx >= 224)             { view_first += ROWS_VIS; clamp_view(); listd = 1; }
+                if (tx < 60 && browse >= 0)        { leave_album(); listd = 1; }
+                else if (tx >= 200 && tx < 224)    { view_first -= ROWS_VIS; clamp_view(); listd = 1; }
+                else if (tx >= 224)                { view_first += ROWS_VIS; clamp_view(); listd = 1; }
             } else if (ty >= PANEL_Y) {
                 int dy = ty - CTRL_Y; if (dy < 0) dy = -dy;
                 int dpx = tx - PLAY_X;  if (dpx < 0) dpx = -dpx;
@@ -2306,9 +3023,9 @@ int main(int argc, char **argv)
                         else paused = !paused;
                         ctrl = 1; listd = 1;
                     } else if (tx >= PREV_X - 18 && tx <= PREV_X + 18) {
-                        next_track(-1); full = 1;
+                        next_track(-1); full = 1; recenter = 1;
                     } else if (tx >= NEXT_X - 18 && tx <= NEXT_X + 18) {
-                        next_track(+1); full = 1;
+                        next_track(+1); full = 1; recenter = 1;
                     } else if (tx >= LOOP_X && tx < LOOP_X + LOOP_W) {
                         loop_mode = (loop_mode + 1) % 3; ctrl = 1;
                     } else if (tx >= SHUF_X && tx < SHUF_X + SHUF_W) {
@@ -2327,11 +3044,11 @@ int main(int argc, char **argv)
             } else {
                 close_track();         // end of list, loop off
             }
-            full = 1;
+            full = 1; recenter = 1;
         }
 
         if (full) {
-            if (cur != prev_cur || (down & (KEY_R | KEY_RIGHT | KEY_L | KEY_LEFT))) center_view_on_current();
+            if (recenter) center_view_on_current();
             refresh_all();
         } else {
             if (listd) draw_list();
