@@ -2060,14 +2060,23 @@ static void draw_text_right(u16 *fb, const Font *f, int xr, int y, const char *s
 // needs very little memory. Non-square pictures are centre-cropped.
 // Supported: all normal PNGs (grey, RGB, palette, with/without alpha, 1-16 bit)
 // except interlaced ones.
+//
+// Decoding a big PNG is slow on the DS, so the result is saved next to the
+// picture (".koicover") and every album is prepared once at start-up.
 
 #define COVER_MAX 96
 #define PNG_MAXW  4096
+#define THUMB     16
 
 static u16 cover_pix[COVER_MAX * COVER_MAX];
 static int cover_s = 0;                    // side of the loaded cover (0 = none)
 static const char *cover_err = NULL;       // why icon.png could not be used
 static int cover_avg[3];
+static u16 albthumb[MAX_ALBUMS][THUMB * THUMB];   // small cover per album
+static unsigned char albhas[MAX_ALBUMS];
+
+static void (*load_hook)(int row, int rows) = NULL;   // progress callback
+static int load_abort = 0;
 
 static u32 acc_r[COVER_MAX * COVER_MAX];
 static u32 acc_g[COVER_MAX * COVER_MAX];
@@ -2084,7 +2093,7 @@ static int pfail, pdone;
 static unsigned png_w, png_h;
 static int png_ct, png_bd, png_ch, png_bpp, png_rowbytes;
 static unsigned char png_pal[256][3];
-static int png_y, png_cx0, png_cy0, png_sw, png_ts;
+static int png_y, png_cx0, png_cy0, png_sw, png_ts, png_step;
 
 static unsigned char rowA[PNG_MAXW * 8 + 8], rowB[PNG_MAXW * 8 + 8];
 static unsigned char *rowcur, *rowprev;
@@ -2122,19 +2131,28 @@ static int png_getb(void)
     }
 }
 
+// 32-bit bit buffer, filled a byte at a time
+static inline void need(int n)
+{
+    while (bcnt < n) { bbuf |= (unsigned)png_getb() << bcnt; bcnt += 8; }
+}
+
 static inline int getbit(void)
 {
-    if (bcnt == 0) { bbuf = (unsigned)png_getb(); bcnt = 8; }
+    need(1);
     int b = (int)(bbuf & 1);
     bbuf >>= 1;
     bcnt--;
     return b;
 }
 
-static int getbits(int n)
+static inline int getbits(int n)
 {
-    int v = 0;
-    for (int i = 0; i < n; i++) v |= getbit() << i;
+    if (n == 0) return 0;
+    need(n);
+    int v = (int)(bbuf & ((1u << n) - 1));
+    bbuf >>= n;
+    bcnt -= n;
     return v;
 }
 
@@ -2195,17 +2213,19 @@ static void row_done(void)
     default: pfail = 1; return;
     }
 
+    // Average only every png_step-th pixel and row: for big pictures that is
+    // still plenty of samples per thumbnail pixel, and much faster.
     int y = png_y;
-    if (y >= png_cy0 && y < png_cy0 + png_sw) {
+    if (y >= png_cy0 && y < png_cy0 + png_sw && ((y - png_cy0) % png_step) == 0) {
         int ty = (y - png_cy0) * png_ts / png_sw;
         int fast = (png_bd == 8 && (png_ct == 2 || png_ct == 6));
         int st = png_ct == 6 ? 4 : 3;
         const unsigned char *rp = cur + png_cx0 * st;
-        for (int k = 0; k < png_sw; k++) {
+        for (int k = 0; k < png_sw; k += png_step) {
             int r, g, b, a;
             if (fast) {
                 r = rp[0]; g = rp[1]; b = rp[2]; a = (st == 4) ? rp[3] : 255;
-                rp += st;
+                rp += st * png_step;
             } else {
                 png_px(cur, png_cx0 + k, &r, &g, &b, &a);
             }
@@ -2223,7 +2243,11 @@ static void row_done(void)
     rowfill = 0;
     png_y++;
     if (png_y >= (int)png_h) pdone = 1;
-    if ((png_y & 15) == 0) service_audio();       // keep the music going while loading
+    if ((png_y & 15) == 0) {
+        service_audio();                          // keep the music going while loading
+        if (load_hook) load_hook(png_y, (int)png_h);
+        if (load_abort) pfail = 1;
+    }
 }
 
 static inline void emit(unsigned char c)
@@ -2235,14 +2259,15 @@ static inline void emit(unsigned char c)
     if (rowfill == rowlen) row_done();
 }
 
-// ---- inflate (the classic canonical-Huffman method)
-typedef struct { short count[16]; short symbol[288]; } Huff;
+// ---- inflate (canonical Huffman with a 9-bit look-up table for speed)
+typedef struct { short count[16]; short symbol[288]; unsigned short fast[512]; } Huff;
 static Huff h_len, h_dist, h_fixlen, h_fixdist;
 static int fixed_ready;
 
 static int huff_build(Huff *h, const short *length, int n)
 {
     short offs[16];
+    memset(h->fast, 0, sizeof h->fast);
     for (int len = 0; len <= 15; len++) h->count[len] = 0;
     for (int sym = 0; sym < n; sym++) h->count[length[sym]]++;
     if (h->count[0] == n) return 0;
@@ -2256,12 +2281,31 @@ static int huff_build(Huff *h, const short *length, int n)
     for (int len = 1; len < 15; len++) offs[len + 1] = (short)(offs[len] + h->count[len]);
     for (int sym = 0; sym < n; sym++)
         if (length[sym] != 0) h->symbol[offs[length[sym]]++] = (short)sym;
+
+    // look-up table for all codes of up to 9 bits (bit-reversed: deflate sends LSB first)
+    int code = 0, idx = 0;
+    for (int len = 1; len <= 9; len++) {
+        for (int i = 0; i < h->count[len]; i++, idx++, code++) {
+            int sym = h->symbol[idx], rev = 0;
+            for (int b = 0; b < len; b++) if (code & (1 << b)) rev |= 1 << (len - 1 - b);
+            for (int k = rev; k < 512; k += 1 << len) h->fast[k] = (unsigned short)((len << 9) | sym);
+        }
+        code <<= 1;
+    }
     return left;
 }
 
 static int huff_decode(const Huff *h)
 {
-    int code = 0, first = 0, index = 0;
+    need(15);
+    unsigned e = h->fast[bbuf & 511];
+    if (e) {
+        int l = (int)(e >> 9);
+        bbuf >>= l;
+        bcnt -= l;
+        return (int)(e & 511);
+    }
+    int code = 0, first = 0, index = 0;           // long codes: bit by bit
     for (int len = 1; len <= 15; len++) {
         code |= getbit();
         int count = h->count[len];
@@ -2305,11 +2349,13 @@ static int inflate_codes(const Huff *lc, const Huff *dc)
 
 static int inflate_stored(void)
 {
-    bcnt = 0;
-    int len = png_getb(); len |= png_getb() << 8;
-    int nlen = png_getb(); nlen |= png_getb() << 8;
+    int drop = bcnt & 7;                          // go to a byte boundary
+    bbuf >>= drop;
+    bcnt -= drop;
+    int len = getbits(16);
+    int nlen = getbits(16);
     if (len != (~nlen & 0xFFFF)) return -2;
-    while (len-- > 0 && !pfail && !pdone) emit((unsigned char)png_getb());
+    while (len-- > 0 && !pfail && !pdone) emit((unsigned char)getbits(8));
     return 0;
 }
 
@@ -2323,7 +2369,7 @@ static int inflate_dynamic(void)
     for (idx = 0; idx < ncode; idx++) lengths[order[idx]] = (short)getbits(3);
     for (; idx < 19; idx++) lengths[order[idx]] = 0;
 
-    Huff hc;
+    static Huff hc;
     if (huff_build(&hc, lengths, 19) != 0) return -4;
 
     idx = 0;
@@ -2358,6 +2404,7 @@ static int png_inflate(void)
     int cmf = png_getb(), flg = png_getb();
     if ((cmf & 15) != 8 || (flg & 0x20)) return -20;
     bcnt = 0;
+    bbuf = 0;
     wpos = 0;
     int last;
     do {
@@ -2449,6 +2496,8 @@ static const char *png_read(void)
     png_cx0 = (int)(png_w - (unsigned)png_sw) / 2;
     png_cy0 = (int)(png_h - (unsigned)png_sw) / 2;
     png_ts = png_sw < COVER_MAX ? png_sw : COVER_MAX;
+    png_step = png_sw / (png_ts * 3);
+    if (png_step < 1) png_step = 1;
     for (int k = 0; k < png_sw; k++) xmap[k] = (u16)(k * png_ts / png_sw);
 
     memset(acc_r, 0, sizeof acc_r); memset(acc_g, 0, sizeof acc_g);
@@ -2480,21 +2529,206 @@ static const char *png_read(void)
     return NULL;
 }
 
-// Load "icon.png" from the folder of the playing album (if there is one).
-static void load_cover(void)
+// ---- cache: the decoded thumbnail is stored next to icon.png
+
+typedef struct {
+    char magic[4];
+    unsigned src_size, src_hash;
+    unsigned short side, err;
+    short avg[3];
+    unsigned short pad;
+} CoverHdr;
+
+static const char *const cover_errs[] = { NULL, "not a PNG", "bad PNG", "interlaced", "too wide", "bad data" };
+
+static int err_index(const char *e)
+{
+    for (int i = 1; i < 6; i++) if (strcmp(e, cover_errs[i]) == 0) return i;
+    return 5;
+}
+
+// size + a hash of the first bytes: tells us when icon.png was replaced
+static int cover_fingerprint(const char *path, unsigned *size, unsigned *hash)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    unsigned char b[2048];
+    size_t n = fread(b, 1, sizeof b, f);
+    fclose(f);
+    unsigned h = 2166136261u;
+    for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 16777619u;
+    *size = (unsigned)sz;
+    *hash = h;
+    return 1;
+}
+
+// Load the cover of the album in `dir`: from the cache if possible,
+// otherwise decode icon.png (slow) and save the result for next time.
+static void cover_load_dir(const char *dir)
 {
     cover_s = 0;
     cover_err = NULL;
-    if (play_album < 0) return;
+    load_abort = 0;
 
-    char path[NAME_LEN * 3];
-    join_path(path, sizeof path, playdir, "icon.png");
-    pf = fopen(path, "rb");
+    char png_path[NAME_LEN * 3], cache_path[NAME_LEN * 3];
+    join_path(png_path, sizeof png_path, dir, "icon.png");
+    join_path(cache_path, sizeof cache_path, dir, ".koicover");
+
+    unsigned sz, hs;
+    if (!cover_fingerprint(png_path, &sz, &hs)) return;      // no icon.png here
+
+    FILE *cf = fopen(cache_path, "rb");
+    if (cf) {
+        CoverHdr h;
+        if (fread(&h, sizeof h, 1, cf) == 1 && memcmp(h.magic, "KOI2", 4) == 0 &&
+            h.src_size == sz && h.src_hash == hs) {
+            if (h.side == 0) {                                // remembered failure
+                cover_err = cover_errs[h.err >= 1 && h.err <= 5 ? h.err : 5];
+                fclose(cf);
+                return;
+            }
+            if (h.side <= COVER_MAX &&
+                fread(cover_pix, 2, (size_t)h.side * h.side, cf) == (size_t)h.side * h.side) {
+                cover_s = h.side;
+                for (int i = 0; i < 3; i++) cover_avg[i] = h.avg[i];
+                fclose(cf);
+                return;
+            }
+        }
+        fclose(cf);
+    }
+
+    pf = fopen(png_path, "rb");
     if (!pf) return;
     cover_err = png_read();
     fclose(pf);
     pf = NULL;
     if (cover_err) cover_s = 0;
+    if (load_abort) { cover_err = "skipped"; cover_s = 0; return; }   // do not cache
+
+    CoverHdr h;
+    memset(&h, 0, sizeof h);
+    memcpy(h.magic, "KOI2", 4);
+    h.src_size = sz;
+    h.src_hash = hs;
+    h.side = (unsigned short)cover_s;
+    h.err = cover_err ? (unsigned short)err_index(cover_err) : 0;
+    for (int i = 0; i < 3; i++) h.avg[i] = (short)cover_avg[i];
+    FILE *wf = fopen(cache_path, "wb");                       // may fail (read-only card): fine
+    if (wf) {
+        fwrite(&h, sizeof h, 1, wf);
+        if (cover_s > 0) fwrite(cover_pix, 2, (size_t)cover_s * cover_s, wf);
+        fclose(wf);
+    }
+}
+
+// shrink the loaded cover to a THUMB x THUMB picture
+static void make_thumb(u16 *dst)
+{
+    int b = cover_s / THUMB;
+    for (int j = 0; j < THUMB; j++) {
+        for (int i = 0; i < THUMB; i++) {
+            if (b < 2) {
+                dst[j * THUMB + i] = cover_pix[(j * cover_s / THUMB) * cover_s + (i * cover_s / THUMB)];
+            } else {
+                int r = 0, g = 0, bl = 0;
+                for (int y = 0; y < b; y++)
+                    for (int x = 0; x < b; x++) {
+                        u16 p = cover_pix[(j * b + y) * cover_s + (i * b + x)];
+                        r += p & 31; g += (p >> 5) & 31; bl += (p >> 10) & 31;
+                    }
+                int n = b * b;
+                dst[j * THUMB + i] = (u16)(0x8000 | (r / n) | ((g / n) << 5) | ((bl / n) << 10));
+            }
+        }
+    }
+}
+
+// Load "icon.png" of the album that is playing (cached, so normally instant).
+static void load_cover(void)
+{
+    cover_s = 0;
+    cover_err = NULL;
+    if (play_album < 0) return;
+    cover_load_dir(playdir);
+    if (cover_s > 0) {
+        make_thumb(albthumb[play_album]);
+        albhas[play_album] = 1;
+    }
+}
+
+// ---- start-up: prepare every album once, with a progress screen
+
+static const char *pre_name = "";
+static int pre_i = 0, pre_n = 1, pre_drawn = 0;
+
+static void pre_draw_static(void)
+{
+    fill_rect(fbT, 0, 0, SW, SH, C_BG);
+    fill_rect(fbB, 0, 0, SW, SH, C_BG);
+    draw_text(fbT, &F_LG, 16, 50, "Preparing covers", C_WHITE);
+    draw_text(fbT, &F_SM, 16, 80, "One-time step, saved on your SD card,", C_GREY);
+    draw_text(fbT, &F_SM, 16, 93, "so the next start is instant.", C_GREY);
+    draw_text(fbT, &F_SM, 16, 165, "Hold B to skip", C_DIM);
+    draw_text_right(fbT, &F_SB, 240, 178, "made by koi", C_GREEN);
+    pre_drawn = 1;
+}
+
+static void pre_hook(int row, int rows)
+{
+    if (!pre_drawn) pre_draw_static();
+    int pct = pre_i * 1000 / pre_n + (rows > 0 ? row * 1000 / rows / pre_n : 0);
+    if (pct > 1000) pct = 1000;
+
+    fill_rect(fbT, 0, 118, SW, 40, C_BG);
+    char shown[NAME_LEN + 8], line[48];
+    fit_text(shown, sizeof shown, &F_MD, pre_name, 224);
+    draw_text(fbT, &F_MD, 16, 118, shown, C_WHITE);
+    fill_rrect(fbT, 16, 138, 224, 6, 3, C_TRACK);
+    int w = 224 * pct / 1000;
+    if (w > 0) fill_rrect(fbT, 16, 138, w < 6 ? 6 : w, 6, 3, C_GREEN);
+    snprintf(line, sizeof line, "Album %d of %d  -  %d%%", pre_i + 1, pre_n, pct / 10);
+    draw_text(fbT, &F_SM, 16, 148, line, C_GREY);
+
+    scanKeys();
+    if (keysHeld() & KEY_B) load_abort = 1;
+    flush_screens();
+}
+
+static void preload_covers(void)
+{
+    int n = 0;
+    for (int i = 0; i < nalb; i++) {
+        char p[NAME_LEN * 3], d[NAME_LEN * 3];
+        unsigned sz, hs;
+        join_path(d, sizeof d, dirpath, albums[i]);
+        join_path(p, sizeof p, d, "icon.png");
+        if (cover_fingerprint(p, &sz, &hs)) n++;
+    }
+    if (n == 0) return;
+
+    load_hook = pre_hook;
+    pre_n = n;
+    pre_i = 0;
+    pre_drawn = 0;
+    for (int i = 0; i < nalb && !load_abort; i++) {
+        char p[NAME_LEN * 3], d[NAME_LEN * 3];
+        unsigned sz, hs;
+        join_path(d, sizeof d, dirpath, albums[i]);
+        join_path(p, sizeof p, d, "icon.png");
+        if (!cover_fingerprint(p, &sz, &hs)) continue;
+        pre_name = albums[i];
+        cover_load_dir(d);
+        if (cover_s > 0) { make_thumb(albthumb[i]); albhas[i] = 1; }
+        pre_i++;
+    }
+    load_hook = NULL;
+    load_abort = 0;
+    cover_s = 0;
+    cover_err = NULL;
 }
 
 // ------------------------------------------------------------ colours
@@ -2797,10 +3031,10 @@ static void draw_row(int idx)
     char nm[NAME_LEN], shown[NAME_LEN + 4];
     if (folder) {
         int here = (play_album == idx);
-        if (here && cover_s > 0) {
-            for (int j = 0; j < 16; j++)
-                for (int i = 0; i < 16; i++)
-                    putpx(fbB, 11 + i, y + 4 + j, cover_pix[(j * cover_s / 16) * cover_s + (i * cover_s / 16)]);
+        if (albhas[idx]) {
+            for (int j = 0; j < THUMB; j++)
+                for (int i = 0; i < THUMB; i++)
+                    putpx(fbB, 11 + i, y + 4 + j, albthumb[idx][j * THUMB + i]);
         } else {
             draw_folder(11, y + 5, here ? C_GREEN : C_GREY);
         }
@@ -2952,6 +3186,8 @@ int main(int argc, char **argv)
         }
     }
     strcpy(playdir, dirpath);
+
+    preload_covers();                // decode new icon.png files once (cached on the SD card)
 
     refresh_all();                   // show the library before the first (slow) load
     flush_screens();
