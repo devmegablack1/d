@@ -4378,7 +4378,7 @@ static void draw_eq(int x, int y, int active)
     for (int i = 0; i < 3; i++) {
         int h = 4;
         if (active) {
-            int t = (int)((vtick / 12 + (unsigned)(ph[i] * 3 + i * 7)) % 16);
+            int t = (int)((vtick / 18 + (unsigned)(ph[i] * 3 + i * 7)) % 16);
             h = 3 + (t < 8 ? t : 15 - t);
         }
         fill_rect(fbB, x + i * 4, y + 12 - h, 3, h, C_GREEN);
@@ -4714,7 +4714,7 @@ int main(int argc, char **argv)
             if (ctrl)  draw_controls();
             if (!topd && (listd || ctrl)) draw_progress();
             if (nfiles > 0 && !listd && !ctrl) {
-                if (now - t_eq >= 100)   { t_eq = now;   eq_refresh(); }
+                if (now - t_eq >= 150)   { t_eq = now;   eq_refresh(); }
                 if (now - t_prog >= 500) { t_prog = now; draw_progress(); }
             }
         }
