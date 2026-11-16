@@ -54,6 +54,13 @@ static int  nb = 0;
 static int  browse = -1;                  // library view: -1 = main, else album
 static int  play_album = -1;              // list that is playing (-1 = main)
 
+typedef struct { char title[48], artist[32]; unsigned char ok; } RowMeta;   // tags shown in the list
+static RowMeta rmeta[MAX_FILES];          // for rootf[]
+static RowMeta bmeta[MAX_FILES];          // for bfiles[]
+
+static void track_begin(const char *path);   // reads tags / cover / lyrics (UI part)
+static void jp_cancel(void);
+
 static FILE *mp3f = NULL;
 static HMP3Decoder hdec = NULL;
 static unsigned char inbuf[IN_BUF_SIZE];
@@ -218,6 +225,7 @@ static void close_track(void)
     if (mp3f) { fclose(mp3f); mp3f = NULL; }
     if (hdec) { MP3FreeDecoder(hdec); hdec = NULL; }
     playing = 0;
+    jp_cancel();
 }
 
 static int open_track(int index)
@@ -279,6 +287,7 @@ static int open_track(int index)
 
     stream_open = 1;
     cur = index;
+    track_begin(path);               // tags, cover, lyrics of this song
     return 1;
 }
 
@@ -348,6 +357,7 @@ static void scan_library(void)
 {
     nalb = 0;
     nroot = scan_mp3s(dirpath, rootf, MAX_FILES);
+    memset(rmeta, 0, sizeof rmeta);
 
     DIR *d = opendir(dirpath);
     if (!d) return;
@@ -477,7 +487,11 @@ static void flush_screens(void)
 #define NEXT_X      170
 #define LOOP_X      6
 #define LOOP_W      58
-#define SHUF_X      192
+#define SHUF_X      6
+#define LYR_X       192
+#define LYR_W       58
+#define PILL1_Y     152
+#define PILL2_Y     172
 #define SHUF_W      58
 
 typedef struct { unsigned char w, h; signed char xo, yo; unsigned char adv; unsigned short off; } FGlyph;
@@ -1962,6 +1976,8 @@ static int glyph_index(int ch)
 }
 
 // Next character of a UTF-8 string as plain ASCII (accents are dropped).
+static const char latx[] = "AaAaAaCcCcCcCcDdDdEeEeEeEeEeGgGgGgGgHhHhIiIiIiIiIiIiJjKkkLlLlLl??LlNnNnNnnNnOoOoOoOoRrRrRrSsSsSsSsTtTtTtUuUuUuUuUuUuWwYyYZzZzZzs";   // U+0100 .. U+017F
+
 static int next_char(const char **ps)
 {
     unsigned char c = (unsigned char)**ps;
@@ -1970,16 +1986,21 @@ static int next_char(const char **ps)
     if (c < 0x80) return c;
 
     int extra = (c & 0xE0) == 0xC0 ? 1 : (c & 0xF0) == 0xE0 ? 2 : (c & 0xF8) == 0xF0 ? 3 : 0;
-    unsigned char first = 0;
+    unsigned cp = extra == 1 ? (c & 0x1Fu) : extra == 2 ? (c & 0x0Fu) : extra == 3 ? (c & 7u) : 0;
+    int got = 0;
     for (int i = 0; i < extra; i++) {
         unsigned char d = (unsigned char)**ps;
         if ((d & 0xC0) != 0x80) break;
-        if (i == 0) first = d;
+        cp = (cp << 6) | (d & 63u);
         (*ps)++;
+        got++;
     }
-    if (c == 0xC3 && first >= 0x80) {
-        int l = 0xC0 + (first - 0x80);              // Latin-1 code point
-        if (l == 0xDF) return 's';                  // sharp s
+    if (extra == 0 || got != extra) return '?';
+
+    if (cp == 0xA0) return ' ';
+    if (cp >= 0xC0 && cp <= 0xFF) {
+        int l = (int)cp;                           // Latin-1 letter
+        if (l == 0xDF) return 's';                 // sharp s
         if (l == 0xD7 || l == 0xF7) return '?';
         int low = l >= 0xE0;
         int b = low ? l - 0x20 : l;
@@ -1996,6 +2017,11 @@ static int next_char(const char **ps)
         if (up == '?') return '?';
         return low ? up + 32 : up;
     }
+    if (cp >= 0x100 && cp <= 0x17F) return latx[cp - 0x100];
+    if ((cp >= 0x2010 && cp <= 0x2015) || cp == 0x2212) return '-';
+    if (cp == 0x2018 || cp == 0x2019 || cp == 0x201A || cp == 0xB4) return '\'';
+    if (cp == 0x201C || cp == 0x201D || cp == 0x201E) return '"';
+    if (cp == 0x2026 || cp == 0x2022 || cp == 0xB7) return '.';
     return '?';
 }
 
@@ -2074,6 +2100,13 @@ static const char *cover_err = NULL;       // why icon.png could not be used
 static int cover_avg[3];
 static u16 albthumb[MAX_ALBUMS][THUMB * THUMB];   // small cover per album
 static unsigned char albhas[MAX_ALBUMS];
+
+// cover_pix above is the decoder's output. These two keep the results:
+static u16 albpix[COVER_MAX * COVER_MAX];  // icon.png of the album that is playing
+static int alb_s = 0, alb_avg[3];
+static const char *alb_err = NULL;
+static u16 tpix[COVER_MAX * COVER_MAX];    // picture of the song that is playing
+static int t_s = 0, t_avg[3];
 
 static void (*load_hook)(int row, int rows) = NULL;   // progress callback
 static int load_abort = 0;
@@ -2438,6 +2471,29 @@ static unsigned be32(const unsigned char *p)
     return ((unsigned)p[0] << 24) | ((unsigned)p[1] << 16) | ((unsigned)p[2] << 8) | p[3];
 }
 
+// turn the thumbnail accumulators into cover_pix; NULL on success
+static const char *cover_finish(int ts)
+{
+    unsigned long tr = 0, tg = 0, tb = 0;
+    int cells = ts * ts, cnt = 0;
+    u16 last = RGB(18, 18, 18);
+    for (int i = 0; i < cells; i++) {
+        if (acc_n[i]) {
+            int n = acc_n[i];
+            int r = (int)(acc_r[i] / (u32)n), g = (int)(acc_g[i] / (u32)n), b = (int)(acc_b[i] / (u32)n);
+            last = RGB(r, g, b);
+            tr += (unsigned long)r; tg += (unsigned long)g; tb += (unsigned long)b; cnt++;
+        }
+        cover_pix[i] = last;
+    }
+    if (cnt == 0) return "bad data";
+    cover_avg[0] = (int)(tr / (unsigned long)cnt);
+    cover_avg[1] = (int)(tg / (unsigned long)cnt);
+    cover_avg[2] = (int)(tb / (unsigned long)cnt);
+    cover_s = ts;
+    return NULL;
+}
+
 // returns NULL on success, otherwise a short reason
 static const char *png_read(void)
 {
@@ -2509,24 +2565,7 @@ static const char *png_read(void)
     int err = png_inflate();
     if (err || !pdone) return "bad data";
 
-    unsigned long tr = 0, tg = 0, tb = 0;
-    int cells = png_ts * png_ts, cnt = 0;
-    u16 last = RGB(18, 18, 18);
-    for (int i = 0; i < cells; i++) {
-        if (acc_n[i]) {
-            int n = acc_n[i];
-            int r = (int)(acc_r[i] / (u32)n), g = (int)(acc_g[i] / (u32)n), b = (int)(acc_b[i] / (u32)n);
-            last = RGB(r, g, b);
-            tr += (unsigned long)r; tg += (unsigned long)g; tb += (unsigned long)b; cnt++;
-        }
-        cover_pix[i] = last;
-    }
-    if (cnt == 0) return "bad data";
-    cover_avg[0] = (int)(tr / (unsigned long)cnt);
-    cover_avg[1] = (int)(tg / (unsigned long)cnt);
-    cover_avg[2] = (int)(tb / (unsigned long)cnt);
-    cover_s = png_ts;
-    return NULL;
+    return cover_finish(png_ts);
 }
 
 // ---- cache: the decoded thumbnail is stored next to icon.png
@@ -2548,13 +2587,13 @@ static int err_index(const char *e)
 }
 
 // size + a hash of the first bytes: tells us when icon.png was replaced
-static int cover_fingerprint(const char *path, unsigned *size, unsigned *hash)
+static int cover_fingerprint(const char *path, long off, unsigned len, unsigned *size, unsigned *hash)
 {
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
     fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    long sz = len ? (long)len : ftell(f);
+    fseek(f, off, SEEK_SET);
     unsigned char b[2048];
     size_t n = fread(b, 1, sizeof b, f);
     fclose(f);
@@ -2567,18 +2606,16 @@ static int cover_fingerprint(const char *path, unsigned *size, unsigned *hash)
 
 // Load the cover of the album in `dir`: from the cache if possible,
 // otherwise decode icon.png (slow) and save the result for next time.
-static void cover_load_dir(const char *dir)
+// png at [off, off+len) of png_path (len 0 = the whole file); result cached in cache_path
+static void cover_load_file(const char *png_path, const char *cache_path, long off, unsigned len)
 {
+    jp_cancel();                      // the decoders share their buffers
     cover_s = 0;
     cover_err = NULL;
     load_abort = 0;
 
-    char png_path[NAME_LEN * 3], cache_path[NAME_LEN * 3];
-    join_path(png_path, sizeof png_path, dir, "icon.png");
-    join_path(cache_path, sizeof cache_path, dir, ".koicover");
-
     unsigned sz, hs;
-    if (!cover_fingerprint(png_path, &sz, &hs)) return;      // no icon.png here
+    if (!cover_fingerprint(png_path, off, len, &sz, &hs)) return;   // no such picture
 
     FILE *cf = fopen(cache_path, "rb");
     if (cf) {
@@ -2603,6 +2640,7 @@ static void cover_load_dir(const char *dir)
 
     pf = fopen(png_path, "rb");
     if (!pf) return;
+    if (off && fseek(pf, off, SEEK_SET) != 0) { fclose(pf); pf = NULL; return; }
     cover_err = png_read();
     fclose(pf);
     pf = NULL;
@@ -2623,6 +2661,14 @@ static void cover_load_dir(const char *dir)
         if (cover_s > 0) fwrite(cover_pix, 2, (size_t)cover_s * cover_s, wf);
         fclose(wf);
     }
+}
+
+static void cover_load_dir(const char *dir)
+{
+    char png_path[NAME_LEN * 3], cache_path[NAME_LEN * 3];
+    join_path(png_path, sizeof png_path, dir, "icon.png");
+    join_path(cache_path, sizeof cache_path, dir, ".koicover");
+    cover_load_file(png_path, cache_path, 0, 0);
 }
 
 // shrink the loaded cover to a THUMB x THUMB picture
@@ -2652,9 +2698,15 @@ static void load_cover(void)
 {
     cover_s = 0;
     cover_err = NULL;
+    alb_s = 0;
+    alb_err = NULL;
     if (play_album < 0) return;
     cover_load_dir(playdir);
+    alb_err = cover_err;
     if (cover_s > 0) {
+        memcpy(albpix, cover_pix, (size_t)cover_s * (size_t)cover_s * 2);
+        alb_s = cover_s;
+        for (int i = 0; i < 3; i++) alb_avg[i] = cover_avg[i];
         make_thumb(albthumb[play_album]);
         albhas[play_album] = 1;
     }
@@ -2706,7 +2758,7 @@ static void preload_covers(void)
         unsigned sz, hs;
         join_path(d, sizeof d, dirpath, albums[i]);
         join_path(p, sizeof p, d, "icon.png");
-        if (cover_fingerprint(p, &sz, &hs)) n++;
+        if (cover_fingerprint(p, 0, 0, &sz, &hs)) n++;
     }
     if (n == 0) return;
 
@@ -2719,7 +2771,7 @@ static void preload_covers(void)
         unsigned sz, hs;
         join_path(d, sizeof d, dirpath, albums[i]);
         join_path(p, sizeof p, d, "icon.png");
-        if (!cover_fingerprint(p, &sz, &hs)) continue;
+        if (!cover_fingerprint(p, 0, 0, &sz, &hs)) continue;
         pre_name = albums[i];
         cover_load_dir(d);
         if (cover_s > 0) { make_thumb(albthumb[i]); albhas[i] = 1; }
@@ -2729,6 +2781,962 @@ static void preload_covers(void)
     load_abort = 0;
     cover_s = 0;
     cover_err = NULL;
+}
+
+// ------------------------------------------------------------ song info
+//
+// Everything about the song that is playing, read straight from the files:
+//   * ID3 tags (v2.2 / v2.3 / v2.4, v1 as a fallback): title, artist, album
+//   * the picture embedded in the tag (JPEG or PNG)
+//   * "<song>.png" next to the song (cover for just this song)
+//   * "<song>.lrc" (synced lyrics)
+// plus the little spectrum analyser for the bars.
+
+static void clean_name(char *dst, size_t cap, const char *src);   // defined below
+
+typedef struct {
+    char title[96], artist[80], album[80];
+    long art_off;                  // where the embedded picture starts in the file
+    unsigned art_len;
+    int art_kind;                  // 0 none, 1 JPEG, 2 PNG
+    int art_unsync;                // picture stored "unsynchronised" (not supported)
+} TagInfo;
+
+static unsigned ss32(const unsigned char *p)       // 28-bit "syncsafe" integer
+{
+    return ((unsigned)(p[0] & 0x7F) << 21) | ((unsigned)(p[1] & 0x7F) << 14) |
+           ((unsigned)(p[2] & 0x7F) << 7)  |  (unsigned)(p[3] & 0x7F);
+}
+
+static void utf8_put(char *dst, size_t cap, size_t *n, unsigned cp)
+{
+    if (cp == 0xFEFF) return;
+    if (cp < 0x20) cp = ' ';
+    if (cp >= 0x10000 || (cp >= 0xD800 && cp < 0xE000)) cp = '?';
+    size_t need = cp < 0x80 ? 1 : cp < 0x800 ? 2 : 3;
+    if (*n + need >= cap) return;
+    if (need == 1) dst[(*n)++] = (char)cp;
+    else if (need == 2) { dst[(*n)++] = (char)(0xC0 | (cp >> 6)); dst[(*n)++] = (char)(0x80 | (cp & 63)); }
+    else { dst[(*n)++] = (char)(0xE0 | (cp >> 12)); dst[(*n)++] = (char)(0x80 | ((cp >> 6) & 63)); dst[(*n)++] = (char)(0x80 | (cp & 63)); }
+}
+
+static int looks_utf8(const unsigned char *b, int n)
+{
+    int high = 0;
+    for (int i = 0; i < n && b[i]; i++) {
+        if (b[i] < 0x80) continue;
+        int extra = (b[i] & 0xE0) == 0xC0 ? 1 : (b[i] & 0xF0) == 0xE0 ? 2 : (b[i] & 0xF8) == 0xF0 ? 3 : -1;
+        if (extra < 0 || i + extra >= n) return 0;
+        for (int k = 1; k <= extra; k++) if ((b[i + k] & 0xC0) != 0x80) return 0;
+        i += extra;
+        high = 1;
+    }
+    return high;
+}
+
+// Text frame body (first byte = encoding) -> UTF-8 in dst.
+static void tag_text(char *dst, size_t cap, const unsigned char *b, int n)
+{
+    size_t o = 0;
+    dst[0] = 0;
+    if (n < 1 || cap < 2) return;
+    int enc = b[0];
+    b++; n--;
+    if (enc == 0 || enc == 3) {
+        int raw = (enc == 3) || looks_utf8(b, n);
+        for (int i = 0; i < n && b[i]; i++) {
+            if (raw) { if (o + 1 < cap) dst[o++] = (char)(b[i] < 0x20 ? ' ' : b[i]); }
+            else utf8_put(dst, cap, &o, b[i]);
+        }
+    } else {
+        int be = (enc == 2), i = 0;
+        if (n >= 2 && b[0] == 0xFF && b[1] == 0xFE) { be = 0; i = 2; }
+        else if (n >= 2 && b[0] == 0xFE && b[1] == 0xFF) { be = 1; i = 2; }
+        for (; i + 1 < n; i += 2) {
+            unsigned c = be ? ((unsigned)b[i] << 8 | b[i + 1]) : ((unsigned)b[i + 1] << 8 | b[i]);
+            if (!c) break;
+            utf8_put(dst, cap, &o, c);
+        }
+    }
+    dst[o] = 0;
+    while (o > 0 && dst[o - 1] == ' ') dst[--o] = 0;
+    size_t lead = 0;
+    while (dst[lead] == ' ') lead++;
+    if (lead) memmove(dst, dst + lead, strlen(dst + lead) + 1);
+}
+
+static void v1_text(char *dst, size_t cap, const unsigned char *b, int n)   // fixed 30-byte field
+{
+    unsigned char tmp[32];
+    if (n > 30) n = 30;
+    tmp[0] = 0;
+    memcpy(tmp + 1, b, (size_t)n);
+    tmp[n + 1] = 0;
+    tag_text(dst, cap, tmp, n + 1);
+}
+
+// Read the tags of an .mp3. With want_art the position of the embedded picture
+// is found too (the picture itself is not read here).
+static void id3_read(const char *path, TagInfo *t, int want_art)
+{
+    memset(t, 0, sizeof *t);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+
+    unsigned char h[10];
+    if (fread(h, 1, 10, f) == 10 && memcmp(h, "ID3", 3) == 0 && h[3] >= 2 && h[3] <= 4 &&
+        !((h[6] | h[7] | h[8] | h[9]) & 0x80)) {
+        int ver = h[3], flags = h[5];
+        long end = 10 + (long)ss32(h + 6);
+        long pos = 10;
+        int best_type = -1;
+        if ((flags & 0x40) && ver >= 3) {                       // extended header: skip it
+            unsigned char eh[4];
+            if (fread(eh, 1, 4, f) == 4) {
+                unsigned es = ver == 4 ? ss32(eh)
+                                       : (((unsigned)eh[0] << 24) | ((unsigned)eh[1] << 16) | ((unsigned)eh[2] << 8) | eh[3]) + 4;
+                pos = 10 + (long)es;
+            }
+        }
+        int hl = ver == 2 ? 6 : 10;
+        for (int nframes = 0; nframes < 400 && pos + hl <= end; nframes++) {
+            unsigned char fh[10];
+            if (fseek(f, pos, SEEK_SET) != 0 || fread(fh, 1, (size_t)hl, f) != (size_t)hl) break;
+            if (fh[0] == 0) break;                              // padding: no more frames
+            long fs;
+            int fl = 0;
+            if (ver == 2) fs = ((long)fh[3] << 16) | ((long)fh[4] << 8) | fh[5];
+            else if (ver == 3) { fs = (long)(((unsigned)fh[4] << 24) | ((unsigned)fh[5] << 16) | ((unsigned)fh[6] << 8) | fh[7]); fl = fh[9]; }
+            else { fs = (long)ss32(fh + 4); fl = fh[9]; }
+            long dpos = pos + hl;
+            if (fs < 0 || dpos + fs > end) break;
+            pos = dpos + fs;
+
+            int skip = 0, dli = 0, funs = 0;
+            if (ver == 3 && (fl & 0xC0)) skip = 1;              // compressed / encrypted
+            if (ver == 4) { if (fl & 0x0C) skip = 1; if (fl & 0x01) dli = 1; if (fl & 0x02) funs = 1; }
+            if (skip) continue;
+            long doff = dpos, dlen = fs;
+            if (dli) { doff += 4; dlen -= 4; }
+            if (dlen <= 0) continue;
+
+            const char *id = (const char *)fh;
+            char *target = NULL;
+            size_t tcap = 0;
+            int is_pic = 0;
+            if (ver == 2) {
+                if (!memcmp(id, "TT2", 3)) { target = t->title;  tcap = sizeof t->title; }
+                else if (!memcmp(id, "TP1", 3)) { target = t->artist; tcap = sizeof t->artist; }
+                else if (!memcmp(id, "TAL", 3)) { target = t->album;  tcap = sizeof t->album; }
+                else if (!memcmp(id, "PIC", 3)) is_pic = 1;
+            } else {
+                if (!memcmp(id, "TIT2", 4)) { target = t->title;  tcap = sizeof t->title; }
+                else if (!memcmp(id, "TPE1", 4)) { target = t->artist; tcap = sizeof t->artist; }
+                else if (!memcmp(id, "TALB", 4)) { target = t->album;  tcap = sizeof t->album; }
+                else if (!memcmp(id, "APIC", 4)) is_pic = 1;
+            }
+
+            if (target) {
+                if (target[0]) continue;
+                unsigned char tb[400];
+                int n = dlen < 399 ? (int)dlen : 399;
+                if (fseek(f, doff, SEEK_SET) == 0 && fread(tb, 1, (size_t)n, f) == (size_t)n)
+                    tag_text(target, tcap, tb, n);
+            } else if (is_pic && want_art) {
+                unsigned char pb[200];
+                int n = dlen < 200 ? (int)dlen : 200;
+                if (fseek(f, doff, SEEK_SET) != 0 || fread(pb, 1, (size_t)n, f) != (size_t)n) continue;
+                int enc = pb[0], i = 1;
+                if (ver == 2) i += 3;                           // 3-letter image format
+                else { while (i < n && pb[i]) i++; i++; }       // MIME type
+                if (i >= n) continue;
+                int ptype = pb[i++];
+                if (enc == 0 || enc == 3) { while (i < n && pb[i]) i++; i++; }
+                else { while (i + 1 < n && (pb[i] || pb[i + 1])) i += 2; i += 2; }
+                if (i >= n) continue;
+                long aoff = doff + i;
+                long alen = dlen - i;
+                unsigned char mg[4];
+                if (alen < 16 || fseek(f, aoff, SEEK_SET) != 0 || fread(mg, 1, 4, f) != 4) continue;
+                int kind = (mg[0] == 0xFF && mg[1] == 0xD8) ? 1 :
+                           (mg[0] == 0x89 && mg[1] == 'P' && mg[2] == 'N' && mg[3] == 'G') ? 2 : 0;
+                if (!kind) continue;
+                if (best_type < 0 || (ptype == 3 && best_type != 3)) {
+                    best_type = ptype;
+                    t->art_off = aoff;
+                    t->art_len = (unsigned)alen;
+                    t->art_kind = kind;
+                    t->art_unsync = ((flags & 0x80) || funs) ? 1 : 0;
+                }
+            }
+            if (!want_art && t->title[0] && t->artist[0]) break;
+        }
+    }
+
+    // ID3v1 at the very end of the file fills whatever is still missing
+    if (!t->title[0] || !t->artist[0]) {
+        unsigned char v1[128];
+        if (fseek(f, -128, SEEK_END) == 0 && fread(v1, 1, 128, f) == 128 && memcmp(v1, "TAG", 3) == 0) {
+            if (!t->title[0])  v1_text(t->title,  sizeof t->title,  v1 + 3, 30);
+            if (!t->artist[0]) v1_text(t->artist, sizeof t->artist, v1 + 33, 30);
+            if (!t->album[0])  v1_text(t->album,  sizeof t->album,  v1 + 63, 30);
+        }
+    }
+    fclose(f);
+}
+
+// ------------------------------------------------------------ JPEG (embedded art)
+//
+// A small JPEG decoder that never builds the full picture: every 8x8 block is
+// reduced right away (1/8, 1/4, 1/2 or full size, whatever gives a cover of
+// about 96 pixels) and averaged into the cover thumbnail. It works in slices,
+// one row of blocks per call, so the music and the screen are never held up.
+// Baseline and progressive files are supported (progressive: the first,
+// low-detail pass is used, which is plenty for a 96-pixel cover).
+
+#define JP_STRIDE 1056
+
+typedef struct {
+    unsigned short fast[512];        // (length << 8) | symbol for codes of <= 9 bits
+    int maxcode[18];
+    int valoff[18];
+    unsigned char vals[256];
+    unsigned char ok;
+} JHuff;
+
+static const unsigned char jzz[64] = {
+     0,  1,  8, 16,  9,  2,  3, 10, 17, 24, 32, 25, 18, 11,  4,  5,
+    12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13,  6,  7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63 };
+
+static const short jT[4][8][8] = {
+  {
+    {362,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0},
+  },
+  {
+    {362,362,0,0,0,0,0,0},
+    {362,-362,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0},
+  },
+  {
+    {362,362,362,362,0,0,0,0},
+    {473,196,-196,-473,0,0,0,0},
+    {362,-362,-362,362,0,0,0,0},
+    {196,-473,473,-196,0,0,0,0},
+    {0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0},
+  },
+  {
+    {362,362,362,362,362,362,362,362},
+    {502,426,284,100,-100,-284,-426,-502},
+    {473,196,-196,-473,-473,-196,196,473},
+    {426,-100,-502,-284,284,502,100,-426},
+    {362,-362,-362,362,362,-362,-362,362},
+    {284,-502,100,426,-426,-100,502,-284},
+    {196,-473,473,-196,-196,473,-473,196},
+    {100,-284,426,-502,502,-426,284,-100},
+  },
+};
+
+
+static JHuff jdc[4], jac[4];
+static unsigned short jqz[4][64];            // quantisation tables, zig-zag order
+static unsigned char jqok[4];
+static struct { int id, h, v, tq, td, ta, pred, stride; } jc[3];
+static int jncomp, jprog, jAl, jri;
+static int jW, jH, jhmax, jvmax, jmcux, jmcuy, jN, jtab;
+static int jmy, jx0, jy0, jsws, jts;
+static FILE *jf = NULL;
+static unsigned jleft;
+static unsigned char jin[512];
+static int jinp, jinn;
+static unsigned jbits;
+static int jcnt, jmarker, jpad, jbad, jrleft;
+static unsigned char jneed[64];
+static unsigned char jstrip[3][16 * JP_STRIDE];
+static int jactive = 0;
+
+static void jp_cancel(void)
+{
+    if (jf) { fclose(jf); jf = NULL; }
+    jactive = 0;
+}
+
+static int jgetc(void)
+{
+    if (jinp >= jinn) {
+        if (!jleft) return -1;
+        unsigned want = jleft < sizeof jin ? jleft : (unsigned)sizeof jin;
+        size_t n = fread(jin, 1, want, jf);
+        if (n == 0) { jleft = 0; return -1; }
+        jleft -= (unsigned)n;
+        jinn = (int)n;
+        jinp = 0;
+    }
+    return jin[jinp++];
+}
+
+static void jfill(void)
+{
+    while (jcnt <= 24) {
+        int b = 0;
+        if (jmarker) {
+            jpad++;                                  // inside a marker: feed zeros
+        } else {
+            b = jgetc();
+            if (b < 0) { b = 0; jpad++; jmarker = 0xD9; }
+            else if (b == 0xFF) {
+                int b2 = jgetc();
+                while (b2 == 0xFF) b2 = jgetc();
+                if (b2 != 0) {                       // 0xFF 0x00 is a stuffed 0xFF
+                    jmarker = b2 < 0 ? 0xD9 : b2;
+                    b = 0; jpad++;
+                }
+            }
+        }
+        jbits |= (unsigned)b << (24 - jcnt);
+        jcnt += 8;
+    }
+}
+
+static int jhuff_build(JHuff *h, const unsigned char *bits, const unsigned char *vals, int nv)
+{
+    memset(h->fast, 0, sizeof h->fast);
+    for (int l = 0; l < 18; l++) { h->maxcode[l] = -1; h->valoff[l] = 0; }
+    memcpy(h->vals, vals, (size_t)nv);
+    int code = 0, k = 0;
+    for (int l = 1; l <= 16; l++) {
+        h->valoff[l] = k - code;
+        for (int i = 0; i < bits[l]; i++) {
+            if (code >= (1 << l)) return 0;
+            if (l <= 9) {
+                int base = code << (9 - l);
+                for (int j = 0; j < (1 << (9 - l)); j++)
+                    h->fast[base + j] = (unsigned short)((l << 8) | vals[k]);
+            }
+            k++; code++;
+        }
+        if (bits[l]) h->maxcode[l] = code - 1;
+        code <<= 1;
+    }
+    h->ok = 1;
+    return 1;
+}
+
+static int jhuff(const JHuff *h)
+{
+    if (jcnt < 16) jfill();
+    int e = h->fast[jbits >> 23];
+    if (e) { int l = e >> 8; jbits <<= l; jcnt -= l; return e & 255; }
+    for (int l = 10; l <= 16; l++) {
+        int code = (int)(jbits >> (32 - l));
+        if (h->maxcode[l] >= 0 && code <= h->maxcode[l]) {
+            jbits <<= l; jcnt -= l;
+            return h->vals[h->valoff[l] + code];
+        }
+    }
+    jbad = 1;
+    jbits <<= 16; jcnt -= 16;
+    return 0;
+}
+
+static inline int jrecv(int s)                       // s = 1..15 bits, sign-extended
+{
+    if (jcnt < 16) jfill();
+    int v = (int)(jbits >> (32 - s));
+    jbits <<= s; jcnt -= s;
+    if (v < (1 << (s - 1))) v -= (1 << s) - 1;
+    return v;
+}
+
+static inline int jclampc(int v) { return v > 4095 ? 4095 : v < -4095 ? -4095 : v; }
+
+static void jblock(int ci, int *blk)
+{
+    const unsigned short *q = jqz[jc[ci].tq];
+    int s = jhuff(&jdc[jc[ci].td]);
+    if (s > 15) { jbad = 1; return; }
+    if (s) jc[ci].pred += jrecv(s);
+    if (jprog) { blk[0] = jclampc(jc[ci].pred * (1 << jAl) * (int)q[0]); return; }
+    blk[0] = jclampc(jc[ci].pred * (int)q[0]);
+    const JHuff *ac = &jac[jc[ci].ta];
+    for (int k = 1; k < 64; ) {
+        int rs = jhuff(ac), r = rs >> 4, sz = rs & 15;
+        if (!sz) { if (r == 15) { k += 16; continue; } break; }
+        k += r;
+        if (k > 63) break;
+        int v = jrecv(sz);
+        if (jneed[k]) blk[jzz[k]] = jclampc(v * (int)q[k]);
+        k++;
+    }
+}
+
+static inline unsigned char jclamp8(int v) { return (unsigned char)(v < 0 ? 0 : v > 255 ? 255 : v); }
+
+static void jidct(const int *blk, unsigned char *out, int stride)
+{
+    const int N = jN;
+    if (N == 1) { out[0] = jclamp8(128 + ((blk[0] + 4) >> 3)); return; }
+    const short (*T)[8] = jT[jtab];
+    int tmp[64];
+    for (int v = 0; v < N; v++)
+        for (int x = 0; x < N; x++) {
+            int s = 0;
+            for (int u = 0; u < N; u++) s += T[u][x] * blk[v * 8 + u];
+            tmp[v * 8 + x] = s >> 6;
+        }
+    for (int y = 0; y < N; y++)
+        for (int x = 0; x < N; x++) {
+            int s = 0;
+            for (int v = 0; v < N; v++) s += T[v][y] * tmp[v * 8 + x];
+            out[y * stride + x] = jclamp8(128 + ((s + (1 << 13)) >> 14));
+        }
+}
+
+static int jp_restart(void)
+{
+    if (!jmarker) {                                   // skip to the next marker
+        for (;;) {
+            int c = jgetc();
+            if (c < 0) return 0;
+            if (c != 0xFF) continue;
+            int c2 = jgetc();
+            while (c2 == 0xFF) c2 = jgetc();
+            if (c2 < 0) return 0;
+            if (c2 != 0) { jmarker = c2; break; }
+        }
+    }
+    if (jmarker < 0xD0 || jmarker > 0xD7) return 0;
+    jmarker = 0; jbits = 0; jcnt = 0; jpad = 0;
+    for (int i = 0; i < 3; i++) jc[i].pred = 0;
+    return 1;
+}
+
+// reduced rows of one row of blocks -> YCbCr -> RGB -> thumbnail accumulators
+static void jp_output_row(int my)
+{
+    int rows = jvmax * jN, base = my * rows;
+    int hs1 = (jncomp == 3) ? (jhmax / jc[1].h) - 1 : 0, vs1 = (jncomp == 3) ? (jvmax / jc[1].v) - 1 : 0;
+    int hs2 = (jncomp == 3) ? (jhmax / jc[2].h) - 1 : 0, vs2 = (jncomp == 3) ? (jvmax / jc[2].v) - 1 : 0;
+    for (int yy = 0; yy < rows; yy++) {
+        int gy = base + yy;
+        if (gy < jy0 || gy >= jy0 + jsws) continue;
+        int ty = (gy - jy0) * jts / jsws;
+        const unsigned char *r0 = jstrip[0] + (yy * jc[0].v / jvmax) * jc[0].stride;
+        const unsigned char *r1 = NULL, *r2 = NULL;
+        if (jncomp == 3) {
+            r1 = jstrip[1] + (yy >> vs1) * jc[1].stride;
+            r2 = jstrip[2] + (yy >> vs2) * jc[2].stride;
+        }
+        for (int k = 0; k < jsws; k++) {
+            int x = jx0 + k;
+            int Y = r0[x], r = Y, g = Y, b = Y;
+            if (jncomp == 3) {
+                int cb = r1[x >> hs1] - 128, cr = r2[x >> hs2] - 128;
+                r = Y + ((91881 * cr) >> 16);
+                g = Y - ((22554 * cb + 46802 * cr) >> 16);
+                b = Y + ((116130 * cb) >> 16);
+                r = r < 0 ? 0 : r > 255 ? 255 : r;
+                g = g < 0 ? 0 : g > 255 ? 255 : g;
+                b = b < 0 ? 0 : b > 255 ? 255 : b;
+            }
+            int idx = ty * jts + xmap[k];
+            acc_r[idx] += (u32)r; acc_g[idx] += (u32)g; acc_b[idx] += (u32)b; acc_n[idx]++;
+        }
+    }
+}
+
+static int jp_mcu_row(void)
+{
+    int blk[64];
+    for (int mx = 0; mx < jmcux; mx++) {
+        if (jri && jrleft == 0) {
+            if (!jp_restart()) return -1;
+            jrleft = jri;
+        }
+        for (int ci = 0; ci < jncomp; ci++) {
+            for (int by = 0; by < jc[ci].v; by++)
+                for (int bx = 0; bx < jc[ci].h; bx++) {
+                    memset(blk, 0, sizeof blk);
+                    jblock(ci, blk);
+                    jidct(blk, jstrip[ci] + (by * jN) * jc[ci].stride + (mx * jc[ci].h + bx) * jN,
+                          jc[ci].stride);
+                }
+        }
+        if (jri) jrleft--;
+        if (jbad || jpad > 512) return -1;
+        if ((mx & 31) == 31) service_audio();
+    }
+    jp_output_row(jmy);
+    return 0;
+}
+
+#define JFAIL(m) do { jp_cancel(); return (m); } while (0)
+
+// Start decoding the JPEG at [off, off+len) of `path`. Returns NULL if it can
+// be decoded (then call jp_step until it is done), or a short reason.
+static const char *jp_begin(const char *path, long off, unsigned len)
+{
+    jp_cancel();
+    jf = fopen(path, "rb");
+    if (!jf) return "open failed";
+    if (fseek(jf, off, SEEK_SET) != 0) JFAIL("seek failed");
+    jleft = len; jinp = jinn = 0;
+    memset(jdc, 0, sizeof jdc); memset(jac, 0, sizeof jac); memset(jqok, 0, sizeof jqok);
+    jncomp = 0; jprog = 0; jri = 0; jW = jH = 0; jAl = 0;
+    int have_sof = 0;
+    unsigned char seg[1104];
+
+    if (jgetc() != 0xFF || jgetc() != 0xD8) JFAIL("not a JPEG");
+    for (;;) {
+        int c = jgetc();
+        if (c < 0) JFAIL("truncated");
+        if (c != 0xFF) continue;
+        int m;
+        do { m = jgetc(); } while (m == 0xFF);
+        if (m < 0) JFAIL("truncated");
+        if (m == 0 || m == 1 || (m >= 0xD0 && m <= 0xD8)) continue;
+        if (m == 0xD9) JFAIL("no image data");
+        int l1 = jgetc(), l2 = jgetc();
+        if (l1 < 0 || l2 < 0) JFAIL("truncated");
+        int L = ((l1 << 8) | l2) - 2;
+        if (L < 0) JFAIL("bad JPEG");
+        if (m >= 0xC3 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) JFAIL("unsupported JPEG");
+        int keep = (m == 0xDB || m == 0xC4 || m == 0xC0 || m == 0xC1 || m == 0xC2 || m == 0xDA || m == 0xDD);
+        if (!keep) {
+            while (L-- > 0) if (jgetc() < 0) JFAIL("truncated");
+            continue;
+        }
+        if (L > (int)sizeof seg) JFAIL("bad JPEG");
+        for (int i = 0; i < L; i++) {
+            int b = jgetc();
+            if (b < 0) JFAIL("truncated");
+            seg[i] = (unsigned char)b;
+        }
+
+        if (m == 0xDB) {
+            int p = 0;
+            while (p < L) {
+                int pq = seg[p] >> 4, tq = seg[p] & 15;
+                p++;
+                if (tq > 3 || pq > 1) JFAIL("bad JPEG");
+                int need = pq ? 128 : 64;
+                if (p + need > L) JFAIL("bad JPEG");
+                for (int i = 0; i < 64; i++)
+                    jqz[tq][i] = pq ? (unsigned short)((seg[p + 2 * i] << 8) | seg[p + 2 * i + 1]) : seg[p + i];
+                p += need;
+                jqok[tq] = 1;
+            }
+        } else if (m == 0xC4) {
+            int p = 0;
+            while (p + 17 <= L) {
+                int tc = seg[p] >> 4, th = seg[p] & 15, nv = 0;
+                if (tc > 1 || th > 3) JFAIL("bad JPEG");
+                for (int i = 1; i <= 16; i++) nv += seg[p + i];
+                if (nv > 256 || p + 17 + nv > L) JFAIL("bad JPEG");
+                if (!jhuff_build(tc ? &jac[th] : &jdc[th], seg + p, seg + p + 17, nv)) JFAIL("bad JPEG");
+                p += 17 + nv;
+            }
+        } else if (m == 0xC0 || m == 0xC1 || m == 0xC2) {
+            if (L < 6 || seg[0] != 8) JFAIL("unsupported JPEG");
+            jH = (seg[1] << 8) | seg[2];
+            jW = (seg[3] << 8) | seg[4];
+            jncomp = seg[5];
+            if ((jncomp != 1 && jncomp != 3) || L < 6 + 3 * jncomp) JFAIL("unsupported JPEG");
+            for (int i = 0; i < jncomp; i++) {
+                jc[i].id = seg[6 + 3 * i];
+                jc[i].h = seg[7 + 3 * i] >> 4;
+                jc[i].v = seg[7 + 3 * i] & 15;
+                jc[i].tq = seg[8 + 3 * i];
+                if (jc[i].h < 1 || jc[i].h > 2 || jc[i].v < 1 || jc[i].v > 2 || jc[i].tq > 3) JFAIL("unsupported JPEG");
+                jc[i].pred = 0;
+            }
+            if (jW < 1 || jH < 1 || jW > 8192 || jH > 8192) JFAIL("too large");
+            jprog = (m == 0xC2);
+            have_sof = 1;
+        } else if (m == 0xDD) {
+            if (L < 2) JFAIL("bad JPEG");
+            jri = (seg[0] << 8) | seg[1];
+        } else {                                       // 0xDA: start of scan
+            if (!have_sof || L < 1) JFAIL("bad JPEG");
+            int ns = seg[0];
+            if (ns != jncomp || L < 1 + 2 * ns + 3) JFAIL("unsupported JPEG");
+            for (int i = 0; i < ns; i++) {
+                int ci = -1;
+                for (int k = 0; k < jncomp; k++) if (jc[k].id == seg[1 + 2 * i]) ci = k;
+                if (ci < 0) JFAIL("bad JPEG");
+                jc[ci].td = seg[2 + 2 * i] >> 4;
+                jc[ci].ta = seg[2 + 2 * i] & 15;
+                if (jc[ci].td > 3 || jc[ci].ta > 3) JFAIL("bad JPEG");
+            }
+            int ss = seg[1 + 2 * ns], ah = seg[3 + 2 * ns] >> 4;
+            jAl = seg[3 + 2 * ns] & 15;
+            if (jprog && (ss != 0 || ah != 0)) JFAIL("unsupported JPEG");
+            break;
+        }
+    }
+
+    if (jncomp == 1) { jc[0].h = jc[0].v = 1; }
+    jhmax = jvmax = 1;
+    for (int i = 0; i < jncomp; i++) {
+        if (jc[i].h > jhmax) jhmax = jc[i].h;
+        if (jc[i].v > jvmax) jvmax = jc[i].v;
+    }
+    for (int i = 0; i < jncomp; i++) {
+        if (!jqok[jc[i].tq] || !jdc[jc[i].td].ok || (!jprog && !jac[jc[i].ta].ok)) JFAIL("bad JPEG");
+        if ((jhmax % jc[i].h) || (jvmax % jc[i].v)) JFAIL("unsupported JPEG");
+    }
+    if (jc[0].h != jhmax || jc[0].v != jvmax) JFAIL("unsupported JPEG");
+    jmcux = (jW + 8 * jhmax - 1) / (8 * jhmax);
+    jmcuy = (jH + 8 * jvmax - 1) / (8 * jvmax);
+
+    int sw0 = jW < jH ? jW : jH;
+    jN = 8;
+    for (int n = 1; n <= 8; n <<= 1) if (sw0 * n / 8 >= COVER_MAX) { jN = n; break; }
+    if (jprog) jN = 1;
+    while (jN > 1 && jmcux * jhmax * jN > JP_STRIDE) jN >>= 1;
+    if (jmcux * jhmax * jN > JP_STRIDE) JFAIL("too wide");
+    jtab = jN == 1 ? 0 : jN == 2 ? 1 : jN == 4 ? 2 : 3;
+    for (int i = 0; i < jncomp; i++) jc[i].stride = jmcux * jc[i].h * jN;
+    for (int k = 0; k < 64; k++) jneed[k] = (unsigned char)(((jzz[k] & 7) < jN) && ((jzz[k] >> 3) < jN));
+
+    int wr_ = (jW * jN + 7) / 8, hr_ = (jH * jN + 7) / 8;
+    jsws = wr_ < hr_ ? wr_ : hr_;
+    jx0 = (wr_ - jsws) / 2;
+    jy0 = (hr_ - jsws) / 2;
+    jts = jsws < COVER_MAX ? jsws : COVER_MAX;
+    if (jts < 1) JFAIL("bad JPEG");
+    for (int k = 0; k < jsws; k++) xmap[k] = (u16)(k * jts / jsws);
+    memset(acc_r, 0, sizeof acc_r); memset(acc_g, 0, sizeof acc_g);
+    memset(acc_b, 0, sizeof acc_b); memset(acc_n, 0, sizeof acc_n);
+
+    jmy = 0; jbits = 0; jcnt = 0; jmarker = 0; jpad = 0; jbad = 0; jrleft = jri;
+    for (int i = 0; i < 3; i++) jc[i].pred = 0;
+    jactive = 1;
+    return NULL;
+}
+
+static const char *cover_finish(int ts);
+
+// Decode up to about `budget` blocks-worth of work. 0 = more to do, 1 = done
+// (the cover is in cover_pix), -1 = failed.
+static int jp_step(int budget)
+{
+    if (!jactive) return -1;
+    do {
+        if (jp_mcu_row() < 0) { jp_cancel(); return -1; }
+        jmy++;
+        budget -= jmcux;
+    } while (jmy < jmcuy && budget > 0);
+    if (jmy < jmcuy) return 0;
+    int ts = jts;
+    jp_cancel();
+    return cover_finish(ts) ? -1 : 1;
+}
+
+// ------------------------------------------------------------ lyrics (.lrc)
+
+#define LYR_MAX   400
+#define LYR_POOL  12000
+
+static int lyr_n = 0;
+static int lyr_ms[LYR_MAX];
+static unsigned short lyr_off[LYR_MAX];
+static char lyr_pool[LYR_POOL];
+static int lyr_used = 0;
+static int lyr_view = 0;                 // top screen shows lyrics instead of the cover
+static int lyr_shown = -2;               // line that is on screen right now
+
+static void swap_ext(char *dst, size_t cap, const char *path, const char *ext)
+{
+    snprintf(dst, cap, "%s", path);
+    char *dot = strrchr(dst, '.'), *sl = strrchr(dst, '/');
+    if (!dot || (sl && dot < sl)) dot = dst + strlen(dst);
+    snprintf(dot, cap - (size_t)(dot - dst), "%s", ext);
+}
+
+// "mm:ss", "mm:ss.x", "mm:ss.xx", "mm:ss.xxx" up to the closing ']'
+static int lrc_time(const char *s, int *ms, const char **end)
+{
+    int mm = 0, k = 0;
+    while (*s >= '0' && *s <= '9' && k < 4) { mm = mm * 10 + (*s - '0'); s++; k++; }
+    if (!k || *s != ':') return 0;
+    s++;
+    int ss = 0; k = 0;
+    while (*s >= '0' && *s <= '9' && k < 3) { ss = ss * 10 + (*s - '0'); s++; k++; }
+    if (!k) return 0;
+    int fr = 0, fd = 0;
+    if (*s == '.' || *s == ':') {
+        s++;
+        while (*s >= '0' && *s <= '9') { if (fd < 3) { fr = fr * 10 + (*s - '0'); fd++; } s++; }
+    }
+    if (*s != ']') return 0;
+    if (fd == 1) fr *= 100; else if (fd == 2) fr *= 10;
+    *ms = (mm * 60 + ss) * 1000 + fr;
+    *end = s + 1;
+    return 1;
+}
+
+static void lyrics_load(const char *mp3path)
+{
+    lyr_n = 0; lyr_used = 0; lyr_shown = -2;
+    char p[NAME_LEN * 3];
+    swap_ext(p, sizeof p, mp3path, ".lrc");
+    FILE *f = fopen(p, "rb");
+    if (!f) return;
+
+    char line[512];
+    int first = 1;
+    while (fgets(line, sizeof line, f) && lyr_n < LYR_MAX) {
+        size_t ll = strlen(line);
+        if (ll == sizeof line - 1 && line[ll - 1] != '\n') {          // very long line: drop the rest
+            int c;
+            while ((c = fgetc(f)) != EOF && c != '\n') { }
+        }
+        char *s = line;
+        if (first) {
+            first = 0;
+            if ((unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF) s += 3;
+        }
+        int times[8], nt = 0;
+        while (*s == '[') {
+            int ms; const char *e;
+            if (lrc_time(s + 1, &ms, &e)) { if (nt < 8) times[nt++] = ms; s = (char *)e; }
+            else { char *q = strchr(s, ']'); if (!q) { s += strlen(s); break; } s = q + 1; if (nt == 0) { nt = -1; break; } }
+        }
+        if (nt <= 0) continue;                                         // tag line or plain text
+
+        char txt[132];
+        size_t o = 0;
+        for (; *s && o < sizeof txt - 1; s++) {
+            if (*s == '<') { char *q = strchr(s, '>'); if (q) { s = q; continue; } }
+            if (*s == '\r' || *s == '\n') break;
+            txt[o++] = *s;
+        }
+        while (o > 0 && txt[o - 1] == ' ') o--;
+        txt[o] = 0;
+        size_t lead = 0;
+        while (txt[lead] == ' ') lead++;
+        if (lyr_used + (int)(o - lead) + 1 > LYR_POOL) break;
+        int off = lyr_used;
+        memcpy(lyr_pool + off, txt + lead, o - lead + 1);
+        lyr_used += (int)(o - lead) + 1;
+        for (int i = 0; i < nt && lyr_n < LYR_MAX; i++) { lyr_ms[lyr_n] = times[i]; lyr_off[lyr_n] = (unsigned short)off; lyr_n++; }
+    }
+    fclose(f);
+
+    for (int i = 1; i < lyr_n; i++) {                                  // stable insertion sort by time
+        int ms = lyr_ms[i]; unsigned short off = lyr_off[i];
+        int j = i - 1;
+        while (j >= 0 && lyr_ms[j] > ms) { lyr_ms[j + 1] = lyr_ms[j]; lyr_off[j + 1] = lyr_off[j]; j--; }
+        lyr_ms[j + 1] = ms; lyr_off[j + 1] = off;
+    }
+}
+
+static int lyr_find(unsigned ms)             // index of the line to show now, or -1
+{
+    int idx = -1;
+    for (int i = 0; i < lyr_n; i++) { if ((unsigned)lyr_ms[i] <= ms) idx = i; else break; }
+    return idx;
+}
+
+// ------------------------------------------------------------ visualizer
+//
+// 16 bars. A short slice of the audio that is about to play is run through a
+// Goertzel filter per bar (one frequency each), using integers only.
+
+#define VIZ_BANDS  16
+#define VIZ_N      512
+#define VQ         16                    // snapshots kept, to delay the bars like the audio
+#define VIZ_DELAY  7                     // in video frames
+#define VIZ_MAXH   88
+
+static short vq[VQ][VIZ_N];
+static short viz_win[VIZ_N];
+static int viz_h[VIZ_BANDS], viz_pk[VIZ_BANDS];
+static int viz_dh[VIZ_BANDS], viz_dpk[VIZ_BANDS];     // what is drawn right now
+static int viz_c14[VIZ_BANDS];
+static int viz_hz = 0;
+static const unsigned short viz_hzs[VIZ_BANDS] = { 50, 75, 110, 160, 230, 330, 470, 670, 950, 1350, 1900, 2700, 3800, 5400, 7700, 11000 };
+
+static double cos_t(double x)
+{
+    double t = 1.0, s = 1.0, x2 = x * x;
+    for (int i = 1; i < 16; i++) { t *= -x2 / ((2 * i - 1) * (2 * i)); s += t; }
+    return s;
+}
+
+static void viz_prepare(int rate)
+{
+    static int win_done = 0;
+    if (!win_done) {
+        for (int i = 0; i < VIZ_N; i++)
+            viz_win[i] = (short)(16383.0 * (1.0 - cos_t(6.283185307179586 * i / (VIZ_N - 1))) + 0.5) ;
+        win_done = 1;
+    }
+    if (rate == viz_hz) return;
+    viz_hz = rate;
+    for (int b = 0; b < VIZ_BANDS; b++) {
+        if (rate <= 0 || viz_hzs[b] * 2.2 > rate) { viz_c14[b] = 0; continue; }
+        double w = 6.283185307179586 * viz_hzs[b] / rate;
+        viz_c14[b] = (int)(2.0 * cos_t(w) * 16384.0);
+    }
+}
+
+// every frame: remember the audio that the ring buffer is about to play
+static void viz_snapshot(void)
+{
+    short *dst = vq[tick % VQ];
+    unsigned r = rd;
+    if (playing && !paused && (wr - r) >= VIZ_N) {
+        for (int i = 0; i < VIZ_N; i++) {
+            unsigned k = (r + (unsigned)i) & RING_MASK;
+            dst[i] = (short)((ring[2 * k] + ring[2 * k + 1]) >> 5);      // mono, +-1024
+        }
+    } else {
+        memset(dst, 0, sizeof vq[0]);
+    }
+}
+
+static int viz_log4(long long p)                        // 4 * log2(p)
+{
+    if (p <= 1) return 0;
+    int msb = 63;
+    while (!((p >> msb) & 1)) msb--;
+    int frac = msb >= 2 ? (int)((p >> (msb - 2)) & 3) : 0;
+    return msb * 4 + frac;
+}
+
+// Returns 1 if the bars moved.
+static int viz_update(void)
+{
+    const short *x = vq[(tick + VQ - VIZ_DELAY) % VQ];
+    int w[VIZ_N], any = 0;
+    for (int i = 0; i < VIZ_N; i++) { w[i] = (x[i] * viz_win[i]) >> 15; if (w[i]) any = 1; }
+
+    for (int b = 0; b < VIZ_BANDS; b++) {
+        int target = 0;
+        if (any && viz_c14[b]) {
+            int s1 = 0, s2 = 0;
+            const long long c = viz_c14[b];
+            for (int i = 0; i < VIZ_N; i++) {
+                int s0 = w[i] + (int)((c * s1) >> 14) - s2;
+                s2 = s1; s1 = s0;
+            }
+            long long p = (long long)s1 * s1 + (long long)s2 * s2 - ((c * s1) >> 14) * s2;
+            int lvl = viz_log4(p) + b * 2;                  // + tilt: music has less energy up high
+            target = (lvl - 56) * VIZ_MAXH / 76;
+            if (target < 0) target = 0;
+            if (target > VIZ_MAXH) target = VIZ_MAXH;
+        }
+        if (target >= viz_h[b]) viz_h[b] = (viz_h[b] + target * 3) / 4;
+        else { viz_h[b] -= 5; if (viz_h[b] < target) viz_h[b] = target; }
+        if (viz_h[b] >= viz_pk[b]) viz_pk[b] = viz_h[b];
+        else if (viz_pk[b] > 0) viz_pk[b]--;
+    }
+    int changed = 0;
+    for (int b = 0; b < VIZ_BANDS; b++)
+        if (viz_h[b] != viz_dh[b] || viz_pk[b] != viz_dpk[b]) changed = 1;
+    return changed;
+}
+
+// ------------------------------------------------------------ the song that is playing
+
+static char cur_title[96], cur_artist[80], cur_album[80];
+static int t_src = 0;                    // cover of this song: 0 none, 1 song.png, 2 embedded
+static int cover_changed = 0;            // top screen needs a redraw (cover arrived)
+
+static const u16 *sh_pix = NULL;         // the cover that is on screen
+static int sh_s = 0;
+static int sh_avg[3];
+
+static void pick_shown(void)
+{
+    sh_s = 0;
+    if (nfiles <= 0) return;
+    if (t_s > 0) {
+        sh_pix = tpix; sh_s = t_s;
+        for (int i = 0; i < 3; i++) sh_avg[i] = t_avg[i];
+    } else if (alb_s > 0 && play_album >= 0) {
+        sh_pix = albpix; sh_s = alb_s;
+        for (int i = 0; i < 3; i++) sh_avg[i] = alb_avg[i];
+    }
+}
+
+static void adopt_cover(int src)
+{
+    memcpy(tpix, cover_pix, (size_t)cover_s * (size_t)cover_s * 2);
+    t_s = cover_s;
+    for (int i = 0; i < 3; i++) t_avg[i] = cover_avg[i];
+    t_src = src;
+}
+
+// hidden cache next to the song: dir/.name.koicover
+static void song_cache_path(char *dst, size_t cap, const char *path)
+{
+    const char *sl = strrchr(path, '/');
+    size_t dl = sl ? (size_t)(sl - path) : 0;
+    const char *base = sl ? sl + 1 : path;
+    const char *dot = strrchr(base, '.');
+    size_t bl = dot ? (size_t)(dot - base) : strlen(base);
+    snprintf(dst, cap, "%.*s/.%.*s.koicover", (int)dl, path, (int)bl, base);
+}
+
+// A new song starts: read its tags, find its cover, load its lyrics.
+static void track_begin(const char *path)
+{
+    jp_cancel();
+    t_s = 0; t_src = 0;
+
+    TagInfo ti;
+    id3_read(path, &ti, 1);
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    if (ti.title[0]) snprintf(cur_title, sizeof cur_title, "%s", ti.title);
+    else clean_name(cur_title, sizeof cur_title, base);
+    snprintf(cur_artist, sizeof cur_artist, "%s", ti.artist);
+    snprintf(cur_album, sizeof cur_album, "%s", ti.album);
+
+    lyrics_load(path);
+    viz_prepare(hz);
+
+    // cover: 1) <song>.png   2) picture inside the tag   3) (album icon.png: automatic fallback)
+    char pp[NAME_LEN * 3], cp[NAME_LEN * 3];
+    swap_ext(pp, sizeof pp, path, ".png");
+    song_cache_path(cp, sizeof cp, path);
+    cover_load_file(pp, cp, 0, 0);
+    if (cover_s > 0) {
+        adopt_cover(1);
+    } else if (ti.art_len && !ti.art_unsync) {
+        if (ti.art_kind == 1 && ti.art_len <= 4u * 1024 * 1024) {
+            jp_begin(path, ti.art_off, ti.art_len);              // finishes in the background
+        } else if (ti.art_kind == 2 && ti.art_len <= 1024u * 1024) {
+            // PNG picture: decoded once, then remembered on the card (shared by the whole album)
+            unsigned sz, hs;
+            if (cover_fingerprint(path, ti.art_off, ti.art_len, &sz, &hs)) {
+                const char *sl = strrchr(path, '/');
+                snprintf(cp, sizeof cp, "%.*s/.art%08x.koicover", sl ? (int)(sl - path) : 0, path, hs ^ (sz * 2654435761u));
+                cover_load_file(path, cp, ti.art_off, ti.art_len);
+                if (cover_s > 0) adopt_cover(2);
+            }
+        }
+    }
+    cover_changed = 1;
 }
 
 // ------------------------------------------------------------ colours
@@ -2777,8 +3785,9 @@ static void pick_colours(void)
     u16 base[3];
     hsv(hue, 160, 105, base);
     memcpy(top_base, base, sizeof base);
-    if (cover_s > 0 && play_album >= 0) {          // tint from the album picture
-        for (int i = 0; i < 3; i++) top_base[i] = (u16)(cover_avg[i] * 115 / 256);
+    pick_shown();
+    if (sh_s > 0) {                                // tint from the cover that is shown
+        for (int i = 0; i < 3; i++) top_base[i] = (u16)(sh_avg[i] * 115 / 256);
     }
     hsv(hue, 175, 235, cov1);
     hsv((hue + 55) % 360, 190, 170, cov2);
@@ -2804,6 +3813,26 @@ static void clean_name(char *dst, size_t cap, const char *src)
     size_t n = strlen(dst);
     if (n > 4) dst[n - 4] = 0;
     for (char *p = dst; *p; p++) if (*p == '_') *p = ' ';
+}
+
+// title / artist of a list row (tags, or the file name when there are none)
+static const RowMeta *row_meta(int in_root, int si)
+{
+    RowMeta *m = in_root ? &rmeta[si] : &bmeta[si];
+    if (m->ok) return m;
+    char (*list)[NAME_LEN] = in_root ? rootf : bfiles;
+    char path[NAME_LEN * 3], d[NAME_LEN * 3];
+    if (in_root) join_path(path, sizeof path, dirpath, list[si]);
+    else { join_path(d, sizeof d, dirpath, albums[browse]); join_path(path, sizeof path, d, list[si]); }
+    TagInfo ti;
+    id3_read(path, &ti, 0);
+    memset(m, 0, sizeof *m);
+    if (ti.title[0]) strncpy(m->title, ti.title, sizeof m->title - 1);
+    else clean_name(m->title, sizeof m->title, list[si]);
+    strncpy(m->artist, ti.artist, sizeof m->artist - 1);
+    m->ok = 1;
+    service_audio();                 // keep the music going while we read from the card
+    return m;
 }
 
 static void fmt_time(char *dst, unsigned sec)
@@ -2842,6 +3871,7 @@ static void enter_album(int i)
     char p[NAME_LEN * 3];
     join_path(p, sizeof p, dirpath, albums[i]);
     nb = scan_mp3s(p, bfiles, MAX_FILES);
+    memset(bmeta, 0, sizeof bmeta);
     browse = i;
     view_first = 0;
     center_view_on_current();
@@ -2867,11 +3897,11 @@ static void album_label(char *dst, size_t cap, const char *src)
 
 static void draw_cover(u16 *fb, int x0, int y0, int s)
 {
-    int pic = (cover_s > 0 && play_album >= 0 && nfiles > 0);
+    int pic = (sh_s > 0 && nfiles > 0);
     for (int j = 0; j < s; j++) {
         for (int i = 0; i < s; i++) {
             u16 c;
-            if (pic) c = cover_pix[(j * cover_s / s) * cover_s + (i * cover_s / s)];
+            if (pic) c = sh_pix[(j * sh_s / s) * sh_s + (i * sh_s / s)];
             else     c = lerp3(cov1, cov2, (i + j) * 256 / (2 * s));
             putpx(fb, x0 + i, y0 + j, c);
         }
@@ -2910,6 +3940,68 @@ static unsigned elapsed_sec(void)
     return sec;
 }
 
+static unsigned elapsed_ms(void)
+{
+    if (!playing || hz <= 0) return 0;
+    unsigned long long so = samples_out;
+    return (unsigned)(so / (unsigned)hz) * 1000u + (unsigned)((so % (unsigned)hz) * 1000u / (unsigned)hz);
+}
+
+// ---- spectrum bars (right of the cover)
+#define VZ_X  128
+#define VZ_Y  8
+#define VZ_H  96
+
+static void draw_viz(void)
+{
+    for (int y = VZ_Y; y < VZ_Y + VZ_H; y++) fill_rect(fbT, VZ_X - 4, y, 128, 1, top_bg(y));
+    int base = VZ_Y + VZ_H - 2;
+    for (int b = 0; b < VIZ_BANDS; b++) {
+        int x = VZ_X + b * 7, h = viz_h[b], pk = viz_pk[b];
+        if (h < 2) {
+            fill_rect(fbT, x, base - 1, 5, 2, C_TRACK);
+        } else {
+            fill_rect(fbT, x, base - h, 5, h, C_GREEN);
+            fill_rect(fbT, x, base - h, 5, 2, RGB(120, 240, 160));
+        }
+        if (pk > h + 2) fill_rect(fbT, x, base - pk - 2, 5, 2, C_WHITE);
+        viz_dh[b] = h; viz_dpk[b] = pk;
+    }
+}
+
+// ---- lyrics instead of the cover
+static void draw_lyrics(void)
+{
+    for (int y = 0; y < 106; y++) fill_rect(fbT, 0, y, SW, 1, top_bg(y));
+    unsigned ms = elapsed_ms();
+    int ci = lyr_find(ms);
+    lyr_shown = ci;
+
+    if (lyr_n == 0) {
+        char hint[NAME_LEN + 24], shown[NAME_LEN + 24], nm[NAME_LEN];
+        const char *msg = "No lyrics for this song";
+        draw_text(fbT, &F_MD, (SW - text_width(&F_MD, msg)) / 2, 34, msg, C_GREY);
+        clean_name(nm, sizeof nm, files[cur]);
+        snprintf(hint, sizeof hint, "Add \"%s.lrc\"", nm);
+        fit_text(shown, sizeof shown, &F_SM, hint, 232);
+        draw_text(fbT, &F_SM, (SW - text_width(&F_SM, shown)) / 2, 56, shown, C_DIM);
+        draw_text(fbT, &F_SM, (SW - text_width(&F_SM, "next to the song")) / 2, 70, "next to the song", C_DIM);
+        return;
+    }
+    static const int ys[5] = { 2, 20, 44, 76, 92 };
+    for (int k = -2; k <= 2; k++) {
+        int idx = ci + k;
+        if (idx < 0 || idx >= lyr_n) continue;
+        const Font *f = k == 0 ? &F_LG : (k == 1 || k == -1) ? &F_MD : &F_SM;
+        if (k == 0 && text_width(f, lyr_pool + lyr_off[idx]) > 236) f = &F_MD;   // long line: smaller font
+        u16 col = k == 0 ? C_WHITE : (k == 1 || k == -1) ? C_GREY : C_DIM;
+        char shown[160];
+        fit_text(shown, sizeof shown, f, lyr_pool + lyr_off[idx], 236);
+        if (!shown[0]) continue;
+        draw_text(fbT, f, (SW - text_width(f, shown)) / 2, ys[k + 2], shown, col);
+    }
+}
+
 // the progress bar, time stamps and status line (cheap, redrawn each second)
 static void draw_progress(void)
 {
@@ -2932,13 +4024,18 @@ static void draw_progress(void)
     draw_text_right(fbT, &F_SM, bx + bw, 163, b, C_GREY);
 
     const char *st = !playing ? "Stopped" : paused ? "Paused" : "Playing";
-    if (play_album >= 0 && cover_err) {
-        char msg[48];
-        snprintf(msg, sizeof msg, "icon.png: %s", cover_err);
-        draw_text(fbT, &F_SM, 16, 178, msg, C_DIM);
+    char info[NAME_LEN + 64], shown[NAME_LEN + 64], al[NAME_LEN];
+    if (play_album >= 0 && alb_err && t_s == 0) {
+        snprintf(info, sizeof info, "icon.png: %s", alb_err);
     } else {
-        draw_text(fbT, &F_SM, 16, 178, st, playing && !paused ? C_GREEN : C_DIM);
+        if (cur_album[0]) snprintf(al, sizeof al, "%s", cur_album);
+        else if (play_album >= 0) album_label(al, sizeof al, albums[play_album]);
+        else al[0] = 0;
+        if (al[0]) snprintf(info, sizeof info, "%s - %s - %d of %d", st, al, cur + 1, nfiles);
+        else       snprintf(info, sizeof info, "%s - %d of %d", st, cur + 1, nfiles);
     }
+    fit_text(shown, sizeof shown, &F_SM, info, 150);
+    draw_text(fbT, &F_SM, 16, 178, shown, playing && !paused ? C_GREEN : C_DIM);
     draw_text_right(fbT, &F_SB, 240, 178, "made by koi", C_GREEN);
 }
 
@@ -2964,23 +4061,29 @@ static void draw_top_full(void)
         return;
     }
 
-    draw_cover(fbT, 80, 10, 96);
+    if (lyr_view) {
+        draw_lyrics();
+    } else {
+        draw_cover(fbT, 12, 8, 96);
+        draw_viz();
+    }
 
-    char nm[NAME_LEN], shown[NAME_LEN + 4];
-    clean_name(nm, sizeof nm, files[cur]);
-    fit_text(shown, sizeof shown, &F_LG, nm, 224);
-    draw_text(fbT, &F_LG, 16, 114, shown, C_WHITE);
+    char shown[NAME_LEN + 4];
+    fit_text(shown, sizeof shown, &F_LG, cur_title, 224);
+    draw_text(fbT, &F_LG, 16, 110, shown, C_WHITE);
 
     char sub[NAME_LEN + 32], subf[NAME_LEN + 36];
-    if (play_album >= 0) {
-        char an[NAME_LEN];
-        album_label(an, sizeof an, albums[play_album]);
-        snprintf(sub, sizeof sub, "%s - %d of %d", an, cur + 1, nfiles);
+    if (cur_artist[0]) {
+        snprintf(sub, sizeof sub, "%s", cur_artist);
+    } else if (cur_album[0]) {
+        snprintf(sub, sizeof sub, "%s", cur_album);
+    } else if (play_album >= 0) {
+        album_label(sub, sizeof sub, albums[play_album]);
     } else {
-        snprintf(sub, sizeof sub, "Song %d of %d", cur + 1, nfiles);
+        snprintf(sub, sizeof sub, "Unknown artist");
     }
     fit_text(subf, sizeof subf, &F_MD, sub, 224);
-    draw_text(fbT, &F_MD, 16, 134, subf, C_GREY);
+    draw_text(fbT, &F_MD, 16, 131, subf, C_GREY);
 
     draw_progress();
 }
@@ -3029,6 +4132,7 @@ static void draw_row(int idx)
     if (sel) fill_rrect(fbB, 4, y + 1, 248, ROW_H - 2, 5, C_ROW);
 
     char nm[NAME_LEN], shown[NAME_LEN + 4];
+    (void)nm;
     if (folder) {
         int here = (play_album == idx);
         if (albhas[idx]) {
@@ -3056,10 +4160,17 @@ static void draw_row(int idx)
         draw_text_right(fbB, &F_SM, 26, y + 6, num, C_DIM);
     }
 
-    char (*list)[NAME_LEN] = browse < 0 ? rootf : bfiles;
-    clean_name(nm, sizeof nm, list[si]);
-    fit_text(shown, sizeof shown, &F_MD, nm, 206);
+    const RowMeta *rm = row_meta(browse < 0, si);
+    int aw = rm->artist[0] ? text_width(&F_SM, rm->artist) : 0;
+    if (aw > 80) aw = 80;
+    int tmax = aw ? 206 - aw - 10 : 206;
+    fit_text(shown, sizeof shown, &F_MD, rm->title, tmax);
     draw_text(fbB, &F_MD, 38, y + 4, shown, sel ? C_GREEN : C_WHITE);
+    if (aw) {
+        char ar[48];
+        fit_text(ar, sizeof ar, &F_SM, rm->artist, aw);
+        draw_text_right(fbB, &F_SM, 244, y + 6, ar, C_DIM);
+    }
 }
 
 static void draw_list(void)
@@ -3095,12 +4206,11 @@ static void draw_list(void)
     }
 }
 
-static void draw_pill(int x, const char *label, int w, int on)
+static void draw_pill(int x, int y, const char *label, int w, int on)
 {
-    int y = CTRL_Y - 10;
-    fill_rrect(fbB, x, y, w, 20, 10, on ? C_GREEN : C_ROW);
+    fill_rrect(fbB, x, y, w, 18, 9, on ? C_GREEN : C_ROW);
     int tw = text_width(&F_SB, label);
-    draw_text(fbB, &F_SB, x + (w - tw) / 2, y + 4, label, on ? C_BLACK : C_GREY);
+    draw_text(fbB, &F_SB, x + (w - tw) / 2, y + 2, label, on ? C_BLACK : C_GREY);
 }
 
 static void draw_controls(void)
@@ -3109,8 +4219,9 @@ static void draw_controls(void)
     fill_rect(fbB, 0, PANEL_Y, SW, 1, C_LINE);
 
     const char *ll = loop_mode == LOOP_ONE ? "LOOP 1" : "LOOP";
-    draw_pill(LOOP_X, ll, LOOP_W, loop_mode != LOOP_NONE);
-    draw_pill(SHUF_X, "SHUFFLE", SHUF_W, shuffle);
+    draw_pill(LOOP_X, PILL1_Y, ll, LOOP_W, loop_mode != LOOP_NONE);
+    draw_pill(SHUF_X, PILL2_Y, "SHUFFLE", SHUF_W, shuffle);
+    draw_pill(LYR_X, CTRL_Y - 9, "LYRICS", LYR_W, lyr_view);
 
     // previous
     fill_rect(fbB, PREV_X - 8, CTRL_Y - 7, 2, 14, C_WHITE);
@@ -3140,6 +4251,7 @@ static void draw_bottom_full(void)
 
 static void refresh_all(void)
 {
+    cover_changed = 0;
     pick_colours();
     draw_top_full();
     draw_bottom_full();
@@ -3206,9 +4318,14 @@ int main(int argc, char **argv)
         flush_screens();             // show what was drawn last frame, tear-free
         tick++;
 
+        if (jactive) {               // embedded cover art is decoded a little every frame
+            if (jp_step(64) == 1) { adopt_cover(2); cover_changed = 1; }
+        }
+        viz_snapshot();
+
         scanKeys();
         u32 down = keysDown();
-        int full = 0, ctrl = 0, listd = 0, recenter = 0;
+        int full = 0, ctrl = 0, listd = 0, recenter = 0, topd = 0;
 
         if (down & KEY_A) {
             if (!playing) open_track(cur);
@@ -3218,7 +4335,8 @@ int main(int argc, char **argv)
         if (down & KEY_B)                { open_track(cur); full = 1; recenter = 1; }
         if (down & (KEY_R | KEY_RIGHT))  { next_track(+1);  full = 1; recenter = 1; }
         if (down & (KEY_L | KEY_LEFT))   { next_track(-1);  full = 1; recenter = 1; }
-        if (down & (KEY_Y | KEY_SELECT)) { loop_mode = (loop_mode + 1) % 3; ctrl = 1; }
+        if (down & KEY_Y)                { loop_mode = (loop_mode + 1) % 3; ctrl = 1; }
+        if (down & KEY_SELECT)           { lyr_view = !lyr_view; topd = 1; ctrl = 1; }
         if (down & KEY_X)                { shuffle = !shuffle; ctrl = 1; }
         if (down & KEY_DOWN)             { view_first++; clamp_view(); listd = 1; }
         if (down & KEY_UP)               { view_first--; clamp_view(); listd = 1; }
@@ -3263,9 +4381,11 @@ int main(int argc, char **argv)
                     } else if (tx >= NEXT_X - 18 && tx <= NEXT_X + 18) {
                         next_track(+1); full = 1; recenter = 1;
                     } else if (tx >= LOOP_X && tx < LOOP_X + LOOP_W) {
-                        loop_mode = (loop_mode + 1) % 3; ctrl = 1;
-                    } else if (tx >= SHUF_X && tx < SHUF_X + SHUF_W) {
-                        shuffle = !shuffle; ctrl = 1;
+                        if (ty < PILL2_Y) loop_mode = (loop_mode + 1) % 3;
+                        else              shuffle = !shuffle;
+                        ctrl = 1;
+                    } else if (tx >= LYR_X && tx < LYR_X + LYR_W) {
+                        lyr_view = !lyr_view; topd = 1; ctrl = 1;
                     }
                 }
             }
@@ -3287,12 +4407,20 @@ int main(int argc, char **argv)
             if (recenter) center_view_on_current();
             refresh_all();
         } else {
+            if (cover_changed || topd) { cover_changed = 0; pick_colours(); draw_top_full(); }
             if (listd) draw_list();
             if (ctrl)  draw_controls();
-            if (listd || ctrl) draw_progress();
+            if (!topd && (listd || ctrl)) draw_progress();
             if (nfiles > 0 && !listd && !ctrl) {
                 if ((tick % 20) == 0) draw_progress();
                 if ((tick % 5) == 0) eq_refresh();
+            }
+            if (nfiles > 0) {
+                if (lyr_view) {
+                    if (playing && lyr_find(elapsed_ms()) != lyr_shown) draw_lyrics();
+                } else if ((tick & 1) == 0 && viz_update()) {
+                    draw_viz();
+                }
             }
         }
     }
