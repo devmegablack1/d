@@ -48,6 +48,7 @@
 
 static u16 time_last = 0;
 static unsigned time_ms_acc = 0, time_frac = 0;
+static unsigned time_rate = 32728;   // timer ticks per second (measured, see time_calibrate)
 static int time_zero = 0;
 static unsigned vtick = 0;            // time in 1/60 s units (animations use this, not the frame count)
 
@@ -56,6 +57,20 @@ static void time_init(void)
     KOI_TIMER_CTRL = 0;
     KOI_TIMER_CTRL = 0x0083;          // enabled, clock / 1024
     time_last = KOI_TIMER_DATA;
+}
+
+// The timer does not tick at the same speed on every console / CPU mode, so measure it
+// against the screen refresh (59.83 Hz) once at start-up.
+static void time_calibrate(void)
+{
+    swiWaitForVBlank();
+    u16 t0 = KOI_TIMER_DATA;
+    for (int i = 0; i < 20; i++) swiWaitForVBlank();
+    unsigned d = (u16)(KOI_TIMER_DATA - t0);
+    unsigned r = (unsigned)((unsigned long long)d * 59826ull / 20000ull);     // ticks per second
+    if (r >= 8000 && r <= 130000) time_rate = r;
+    time_last = KOI_TIMER_DATA;
+    time_frac = 0;
 }
 
 static unsigned now_ms(void)
@@ -67,8 +82,8 @@ static unsigned now_ms(void)
     else {
         time_zero = 0;
         time_frac += d * 1000u;
-        time_ms_acc += time_frac / 32728u;
-        time_frac %= 32728u;
+        time_ms_acc += time_frac / time_rate;
+        time_frac %= time_rate;
     }
     return time_ms_acc;
 }
@@ -2669,46 +2684,34 @@ static int cover_fingerprint(const char *path, long off, unsigned len, unsigned 
 // Load the cover of the album in `dir`: from the cache if possible,
 // otherwise decode icon.png (slow) and save the result for next time.
 // png at [off, off+len) of png_path (len 0 = the whole file); result cached in cache_path
-static void cover_load_file(const char *png_path, const char *cache_path, long off, unsigned len)
+// 1 = cache hit, 2 = a remembered failure, 0 = nothing usable. With want_pix the
+// thumbnail is read into cover_pix, otherwise only the header is checked.
+static int cover_cache_read(const char *cache_path, unsigned sz, unsigned hs, int want_pix)
 {
-    jp_cancel();                      // the decoders share their buffers
-    cover_s = 0;
-    cover_err = NULL;
-    load_abort = 0;
-
-    unsigned sz, hs;
-    if (!cover_fingerprint(png_path, off, len, &sz, &hs)) return;   // no such picture
-
     FILE *cf = fopen(cache_path, "rb");
-    if (cf) {
-        CoverHdr h;
-        if (fread(&h, sizeof h, 1, cf) == 1 && memcmp(h.magic, "KOI2", 4) == 0 &&
-            h.src_size == sz && h.src_hash == hs) {
-            if (h.side == 0) {                                // remembered failure
-                cover_err = cover_errs[h.err >= 1 && h.err <= 5 ? h.err : 5];
-                fclose(cf);
-                return;
-            }
-            if (h.side <= COVER_MAX &&
-                fread(cover_pix, 2, (size_t)h.side * h.side, cf) == (size_t)h.side * h.side) {
+    if (!cf) return 0;
+    int result = 0;
+    CoverHdr h;
+    if (fread(&h, sizeof h, 1, cf) == 1 && memcmp(h.magic, "KOI2", 4) == 0 &&
+        h.src_size == sz && h.src_hash == hs) {
+        if (h.side == 0) {
+            cover_err = cover_errs[h.err >= 1 && h.err <= 5 ? h.err : 5];
+            result = 2;
+        } else if (h.side <= COVER_MAX) {
+            if (!want_pix) result = 1;
+            else if (fread(cover_pix, 2, (size_t)h.side * h.side, cf) == (size_t)h.side * h.side) {
                 cover_s = h.side;
                 for (int i = 0; i < 3; i++) cover_avg[i] = h.avg[i];
-                fclose(cf);
-                return;
+                result = 1;
             }
         }
-        fclose(cf);
     }
+    fclose(cf);
+    return result;
+}
 
-    pf = fopen(png_path, "rb");
-    if (!pf) return;
-    if (off && fseek(pf, off, SEEK_SET) != 0) { fclose(pf); pf = NULL; return; }
-    cover_err = png_read();
-    fclose(pf);
-    pf = NULL;
-    if (cover_err) cover_s = 0;
-    if (load_abort) { cover_err = "skipped"; cover_s = 0; return; }   // do not cache
-
+static void cover_cache_write(const char *cache_path, unsigned sz, unsigned hs)
+{
     CoverHdr h;
     memset(&h, 0, sizeof h);
     memcpy(h.magic, "KOI2", 4);
@@ -2723,6 +2726,29 @@ static void cover_load_file(const char *png_path, const char *cache_path, long o
         if (cover_s > 0) fwrite(cover_pix, 2, (size_t)cover_s * cover_s, wf);
         fclose(wf);
     }
+}
+
+// png at [off, off+len) of png_path (len 0 = the whole file); result cached in cache_path
+static void cover_load_file(const char *png_path, const char *cache_path, long off, unsigned len)
+{
+    jp_cancel();                      // the decoders share their buffers
+    cover_s = 0;
+    cover_err = NULL;
+    load_abort = 0;
+
+    unsigned sz, hs;
+    if (!cover_fingerprint(png_path, off, len, &sz, &hs)) return;   // no such picture
+    if (cover_cache_read(cache_path, sz, hs, 1)) return;
+
+    pf = fopen(png_path, "rb");
+    if (!pf) return;
+    if (off && fseek(pf, off, SEEK_SET) != 0) { fclose(pf); pf = NULL; return; }
+    cover_err = png_read();
+    fclose(pf);
+    pf = NULL;
+    if (cover_err) cover_s = 0;
+    if (load_abort) { cover_err = "skipped"; cover_s = 0; return; }   // do not cache
+    cover_cache_write(cache_path, sz, hs);
 }
 
 static void cover_load_dir(const char *dir)
@@ -2778,12 +2804,13 @@ static void load_cover(void)
 
 static const char *pre_name = "";
 static int pre_i = 0, pre_n = 1, pre_drawn = 0;
+static const char *pre_unit = "Album";
 
 static void pre_draw_static(void)
 {
     fill_rect(fbT, 0, 0, SW, SH, C_BG);
     fill_rect(fbB, 0, 0, SW, SH, C_BG);
-    draw_text(fbT, &F_LG, 16, 50, "Preparing covers", C_WHITE);
+    draw_text(fbT, &F_LG, 16, 50, "Getting your music ready", C_WHITE);
     draw_text(fbT, &F_SM, 16, 80, "One-time step, saved on your SD card,", C_GREY);
     draw_text(fbT, &F_SM, 16, 93, "so the next start is instant.", C_GREY);
     draw_text(fbT, &F_SM, 16, 165, "Hold B to skip", C_DIM);
@@ -2804,7 +2831,7 @@ static void pre_hook(int row, int rows)
     fill_rrect(fbT, 16, 138, 224, 6, 3, C_TRACK);
     int w = 224 * pct / 1000;
     if (w > 0) fill_rrect(fbT, 16, 138, w < 6 ? 6 : w, 6, 3, C_GREEN);
-    snprintf(line, sizeof line, "Album %d of %d  -  %d%%", pre_i + 1, pre_n, pct / 10);
+    snprintf(line, sizeof line, "%s %d of %d  -  %d%%", pre_unit, pre_i + 1 > pre_n ? pre_n : pre_i + 1, pre_n, pct / 10);
     draw_text(fbT, &F_SM, 16, 148, line, C_GREY);
 
     scanKeys();
@@ -3767,9 +3794,46 @@ static void song_cache_path(char *dst, size_t cap, const char *path)
 }
 
 // A new song starts: read its tags, find its cover, load its lyrics.
+// where the cache of an embedded picture lives (shared by every song with the same picture)
+static void art_cache_path(char *dst, size_t cap, const char *path, unsigned sz, unsigned hs)
+{
+    const char *sl = strrchr(path, '/');
+    snprintf(dst, cap, "%.*s/.art%08x.koicover", sl ? (int)(sl - path) : 0, path, hs ^ (sz * 2654435761u));
+}
+
+static char jp_cp[NAME_LEN * 3];             // finished background JPEG gets saved here
+static unsigned jp_sz, jp_hs;
+static int jp_pending = 0;
+
+// Decode an embedded JPEG right now (used by the start-up preparation), cached afterwards.
+static void cover_load_jpeg(const char *path, const char *cache_path, long off, unsigned len)
+{
+    jp_cancel();
+    cover_s = 0;
+    cover_err = NULL;
+    load_abort = 0;
+    unsigned sz, hs;
+    if (!cover_fingerprint(path, off, len, &sz, &hs)) return;
+    if (cover_cache_read(cache_path, sz, hs, 1)) return;
+
+    const char *e = jp_begin(path, off, len);
+    int r = -1;
+    if (!e) {
+        while ((r = jp_step(64)) == 0) {
+            if (load_hook) load_hook(jmy, jmcuy);
+            if (load_abort) { jp_cancel(); r = -2; break; }
+        }
+    }
+    if (r == -2) { cover_err = "skipped"; cover_s = 0; return; }       // do not cache
+    if (r != 1) { cover_s = 0; cover_err = e ? e : "bad data"; }
+    else cover_err = NULL;
+    cover_cache_write(cache_path, sz, hs);
+}
+
 static void track_begin(const char *path)
 {
     jp_cancel();
+    jp_pending = 0;
     t_s = 0; t_src = 0;
 
     TagInfo ti;
@@ -3791,21 +3855,161 @@ static void track_begin(const char *path)
     cover_load_file(pp, cp, 0, 0);
     if (cover_s > 0) {
         adopt_cover(1);
-    } else if (ti.art_len && !ti.art_unsync) {
-        if (ti.art_kind == 1 && ti.art_len <= 4u * 1024 * 1024) {
-            jp_begin(path, ti.art_off, ti.art_len);              // finishes in the background
-        } else if (ti.art_kind == 2 && ti.art_len <= 1024u * 1024) {
-            // PNG picture: decoded once, then remembered on the card (shared by the whole album)
-            unsigned sz, hs;
-            if (cover_fingerprint(path, ti.art_off, ti.art_len, &sz, &hs)) {
-                const char *sl = strrchr(path, '/');
-                snprintf(cp, sizeof cp, "%.*s/.art%08x.koicover", sl ? (int)(sl - path) : 0, path, hs ^ (sz * 2654435761u));
-                cover_load_file(path, cp, ti.art_off, ti.art_len);
-                if (cover_s > 0) adopt_cover(2);
+    } else if (ti.art_len && !ti.art_unsync &&
+               ((ti.art_kind == 1 && ti.art_len <= 4u * 1024 * 1024) ||
+                (ti.art_kind == 2 && ti.art_len <= 1024u * 1024))) {
+        unsigned sz, hs;
+        if (cover_fingerprint(path, ti.art_off, ti.art_len, &sz, &hs)) {
+            art_cache_path(cp, sizeof cp, path, sz, hs);
+            cover_err = NULL;
+            int c = cover_cache_read(cp, sz, hs, 1);            // prepared at start-up: instant
+            if (c == 1) {
+                adopt_cover(2);
+            } else if (c == 0) {                                // new file: decode it now
+                if (ti.art_kind == 2) {
+                    cover_load_file(path, cp, ti.art_off, ti.art_len);
+                    if (cover_s > 0) adopt_cover(2);
+                } else if (!jp_begin(path, ti.art_off, ti.art_len)) {   // in slices, then cached
+                    snprintf(jp_cp, sizeof jp_cp, "%s", cp);
+                    jp_sz = sz; jp_hs = hs; jp_pending = 1;
+                }
             }
         }
     }
     cover_changed = 1;
+}
+
+
+// ------------------------------------------------------------ start-up: prepare the whole library
+//
+// Once per folder (and again only when its list of songs changes): read every
+// song's tags and decode every picture (song.png / embedded) into small cached
+// thumbnails. Afterwards the player only reads those, so nothing loads while
+// music plays. The tags are kept in ".koiindex" so lists open instantly too.
+
+typedef struct { char magic[4]; unsigned sig, n; } IdxHdr;
+
+static unsigned folder_sig(char (*list)[NAME_LEN], int n)
+{
+    unsigned h = 2166136261u ^ (unsigned)n;
+    for (int i = 0; i < n; i++) {
+        for (const char *c = list[i]; *c; c++) h = (h ^ (unsigned char)*c) * 16777619u;
+        h = (h ^ 0xFFu) * 16777619u;
+    }
+    return h ^ 0x4B4F4933u;
+}
+
+static int index_load(const char *dir, RowMeta *out, int n, unsigned sig, int check_sig)
+{
+    char p[NAME_LEN * 3];
+    join_path(p, sizeof p, dir, ".koiindex");
+    FILE *f = fopen(p, "rb");
+    if (!f) return 0;
+    IdxHdr h;
+    int ok = 0;
+    if (fread(&h, sizeof h, 1, f) == 1 && memcmp(h.magic, "KOI3", 4) == 0 && h.n == (unsigned)n &&
+        (!check_sig || h.sig == sig) && n <= MAX_FILES &&
+        fread(out, sizeof(RowMeta), (size_t)n, f) == (size_t)n) {
+        for (int i = 0; i < n; i++) out[i].ok = 1;
+        ok = 1;
+    }
+    fclose(f);
+    return ok;
+}
+
+static void index_save(const char *dir, const RowMeta *m, int n, unsigned sig)
+{
+    char p[NAME_LEN * 3];
+    join_path(p, sizeof p, dir, ".koiindex");
+    FILE *f = fopen(p, "wb");
+    if (!f) return;
+    IdxHdr h;
+    memcpy(h.magic, "KOI3", 4);
+    h.sig = sig;
+    h.n = (unsigned)n;
+    fwrite(&h, sizeof h, 1, f);
+    fwrite(m, sizeof(RowMeta), (size_t)n, f);
+    fclose(f);
+}
+
+static int lib_done = 0;
+
+static void preload_song(const char *dir, const char *name, RowMeta *m)
+{
+    char path[NAME_LEN * 3];
+    join_path(path, sizeof path, dir, name);
+    TagInfo ti;
+    id3_read(path, &ti, 1);
+
+    memset(m, 0, sizeof *m);
+    if (ti.title[0]) strncpy(m->title, ti.title, sizeof m->title - 1);
+    else clean_name(m->title, sizeof m->title, name);
+    strncpy(m->artist, ti.artist, sizeof m->artist - 1);
+    m->ok = 1;
+    pre_name = m->title;
+    pre_hook(0, 1);                                   // progress screen
+
+    char pp[NAME_LEN * 3], cp[NAME_LEN * 3];
+    swap_ext(pp, sizeof pp, path, ".png");            // <song>.png
+    song_cache_path(cp, sizeof cp, path);
+    cover_load_file(pp, cp, 0, 0);
+
+    if (ti.art_len && !ti.art_unsync && !load_abort &&   // picture inside the tag
+        ((ti.art_kind == 1 && ti.art_len <= 4u * 1024 * 1024) ||
+         (ti.art_kind == 2 && ti.art_len <= 1024u * 1024))) {
+        unsigned sz, hs;
+        if (cover_fingerprint(path, ti.art_off, ti.art_len, &sz, &hs)) {
+            art_cache_path(cp, sizeof cp, path, sz, hs);
+            if (!cover_cache_read(cp, sz, hs, 0)) {
+                if (ti.art_kind == 2) cover_load_file(path, cp, ti.art_off, ti.art_len);
+                else                  cover_load_jpeg(path, cp, ti.art_off, ti.art_len);
+            }
+        }
+    }
+}
+
+static void preload_folder(const char *dir, char (*list)[NAME_LEN], int n, RowMeta *meta)
+{
+    if (n <= 0) return;
+    unsigned sig = folder_sig(list, n);
+    if (index_load(dir, meta, n, sig, 1)) { lib_done += n; return; }      // nothing changed
+    memset(meta, 0, (size_t)n * sizeof *meta);
+    for (int i = 0; i < n && !load_abort; i++) {
+        pre_i = lib_done;
+        preload_song(dir, list[i], &meta[i]);
+        lib_done++;
+    }
+    if (!load_abort) index_save(dir, meta, n, sig);
+    else memset(meta, 0, (size_t)n * sizeof *meta);
+}
+
+static void preload_library(void)
+{
+    int total = nroot;
+    for (int i = 0; i < nalb; i++) total += albcount[i];
+    if (total == 0) return;
+
+    load_hook = pre_hook;
+    pre_unit = "Song";
+    pre_n = total;
+    pre_i = 0;
+    pre_drawn = 0;
+    lib_done = 0;
+    load_abort = 0;
+
+    preload_folder(dirpath, rootf, nroot, rmeta);
+    for (int i = 0; i < nalb && !load_abort; i++) {
+        char d[NAME_LEN * 3];
+        join_path(d, sizeof d, dirpath, albums[i]);
+        int n = scan_mp3s(d, bfiles, MAX_FILES);
+        preload_folder(d, bfiles, n, bmeta);
+    }
+    memset(bmeta, 0, sizeof bmeta);
+    load_hook = NULL;
+    load_abort = 0;
+    pre_unit = "Album";
+    cover_s = 0;
+    cover_err = NULL;
 }
 
 // ------------------------------------------------------------ colours
@@ -3941,6 +4145,7 @@ static void enter_album(int i)
     join_path(p, sizeof p, dirpath, albums[i]);
     nb = scan_mp3s(p, bfiles, MAX_FILES);
     memset(bmeta, 0, sizeof bmeta);
+    index_load(p, bmeta, nb, 0, 0);                 // titles / artists saved at start-up
     browse = i;
     view_first = 0;
     center_view_on_current();
@@ -4380,6 +4585,7 @@ int main(int argc, char **argv)
     strcpy(playdir, dirpath);
 
     preload_covers();                // decode new icon.png files once (cached on the SD card)
+    preload_library();               // tags + song pictures, so nothing has to load during playback
 
     refresh_all();                   // show the library before the first (slow) load
     flush_screens();
@@ -4391,6 +4597,7 @@ int main(int argc, char **argv)
     refresh_all();
     flush_screens();
 
+    time_calibrate();                // so that animations run at true speed on any console
     unsigned now = now_ms(), t_prog = now, t_eq = now, t_viz = now, t_frame = now;
     unsigned viz_interval = 50;      // bars update 20 times a second (10 if the CPU is struggling)
     int frames = 0, slow = 0, combine = 0;
@@ -4519,20 +4726,25 @@ int main(int argc, char **argv)
             pump();
             heavy = 1;
         }
-        if (!heavy && jactive) {                             // 2. cover art, one slice at a time
-            if (jp_step(64) == 1) { adopt_cover(2); cover_changed = 1; }
-            heavy = 1;
-        }
-        if (!heavy && nfiles > 0) {                          // 3. lyrics line / visualizer bars
+        if (!heavy && nfiles > 0) {                          // 2. lyrics line / visualizer bars
             if (lyr_view) {
                 if (playing && lyr_find(elapsed_ms()) != lyr_shown) { draw_lyrics(); heavy = 1; }
             } else if (now - t_viz >= viz_interval) {
                 unsigned dtv = now - t_viz;
+                if (dtv > 200) dtv = 200;
                 t_viz = now;
                 viz_snapshot();
                 if (viz_update(dtv, viz_interval)) draw_viz();
                 heavy = 1;
             }
+        }
+        if (!heavy && jactive) {                             // 3. a new picture, one slice at a time
+            if (jp_step(64) == 1) {
+                if (jp_pending) { cover_err = NULL; cover_cache_write(jp_cp, jp_sz, jp_hs); jp_pending = 0; }
+                adopt_cover(2);
+                cover_changed = 1;
+            }
+            heavy = 1;
         }
         if (combine || !heavy || fill < (RING_FRAMES * 3) / 8) {   // 4. otherwise decode music
             pump_budget = 1;
