@@ -3722,6 +3722,8 @@ static int viz_update(unsigned dt_ms, unsigned interval_ms)
     const short *x = vq[(vq_n + VQ * 2 - 1 - lag) % VQ];
     int fall = (int)(5 * dt_ms / 50);                             // bars fall at the same speed at any frame rate
     if (fall < 1) fall = 1;
+    static unsigned pk_acc = 0;
+    pk_acc += dt_ms; int pk_drop = (int)(pk_acc / 110); pk_acc %= 110;      // peak caps sink slowly
     int w[VIZ_N], any = 0;
     for (int i = 0; i < VIZ_N; i++) { w[i] = (x[i] * viz_win[i]) >> 15; if (w[i]) any = 1; }
 
@@ -3740,10 +3742,16 @@ static int viz_update(unsigned dt_ms, unsigned interval_ms)
             if (target < 0) target = 0;
             if (target > VIZ_MAXH) target = VIZ_MAXH;
         }
-        if (target >= viz_h[b]) viz_h[b] = (viz_h[b] + target * 3) / 4;
-        else { viz_h[b] -= fall; if (viz_h[b] < target) viz_h[b] = target; }
+        if (target >= viz_h[b]) viz_h[b] += ((target - viz_h[b]) * 3 + 4) / 7;           // glide up (about 43% of the gap)
+        else {                                                                           // ease down: faster when far, gentle near the end
+            int gap = viz_h[b] - target;
+            int st = (gap * (int)dt_ms) / 330;
+            if (st < 1) st = 1;
+            if (st > fall) st = fall;
+            viz_h[b] -= st; if (viz_h[b] < target) viz_h[b] = target;
+        }
         if (viz_h[b] >= viz_pk[b]) viz_pk[b] = viz_h[b];
-        else if (viz_pk[b] > 0) { viz_pk[b] -= (int)(dt_ms / 50) + 1; if (viz_pk[b] < 0) viz_pk[b] = 0; }
+        else if (viz_pk[b] > 0 && pk_drop) { viz_pk[b] -= pk_drop; if (viz_pk[b] < 0) viz_pk[b] = 0; }
     }
     int changed = 0;
     for (int b = 0; b < VIZ_BANDS; b++)
@@ -4378,7 +4386,7 @@ static void draw_eq(int x, int y, int active)
     for (int i = 0; i < 3; i++) {
         int h = 4;
         if (active) {
-            int t = (int)((vtick / 18 + (unsigned)(ph[i] * 3 + i * 7)) % 16);
+            int t = (int)((vtick / 30 + (unsigned)(ph[i] * 3 + i * 7)) % 16);
             h = 3 + (t < 8 ? t : 15 - t);
         }
         fill_rect(fbB, x + i * 4, y + 12 - h, 3, h, C_GREEN);
@@ -4714,7 +4722,7 @@ int main(int argc, char **argv)
             if (ctrl)  draw_controls();
             if (!topd && (listd || ctrl)) draw_progress();
             if (nfiles > 0 && !listd && !ctrl) {
-                if (now - t_eq >= 150)   { t_eq = now;   eq_refresh(); }
+                if (now - t_eq >= 250)   { t_eq = now;   eq_refresh(); }
                 if (now - t_prog >= 500) { t_prog = now; draw_progress(); }
             }
         }
