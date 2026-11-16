@@ -36,6 +36,43 @@
 #define RING_MASK    (RING_FRAMES - 1)
 #define PUMP_FRAMES  3                // MP3 frames decoded per main-loop pass
 
+// DSi only: switch the ARM9 from 67 to 134 MHz (ignored on a DS / when the launcher locks it)
+#ifndef KOI_SCFG_CLK
+#define KOI_SCFG_CLK  (*(volatile u16 *)0x04004004)
+#endif
+// ARM9 hardware timer 3 as a free-running clock (32.7 kHz) so animations follow real time
+#ifndef KOI_TIMER_CTRL
+#define KOI_TIMER_DATA (*(volatile u16 *)0x0400010C)
+#define KOI_TIMER_CTRL (*(volatile u16 *)0x0400010E)
+#endif
+
+static u16 time_last = 0;
+static unsigned time_ms_acc = 0, time_frac = 0;
+static int time_zero = 0;
+static unsigned vtick = 0;            // time in 1/60 s units (animations use this, not the frame count)
+
+static void time_init(void)
+{
+    KOI_TIMER_CTRL = 0;
+    KOI_TIMER_CTRL = 0x0083;          // enabled, clock / 1024
+    time_last = KOI_TIMER_DATA;
+}
+
+static unsigned now_ms(void)
+{
+    u16 t = KOI_TIMER_DATA;
+    unsigned d = (u16)(t - time_last);
+    time_last = t;
+    if (d == 0) { if (++time_zero > 120) time_ms_acc += 17; }      // timer not running: assume 60 fps
+    else {
+        time_zero = 0;
+        time_frac += d * 1000u;
+        time_ms_acc += time_frac / 32728u;
+        time_frac %= 32728u;
+    }
+    return time_ms_acc;
+}
+
 enum { LOOP_NONE = 0, LOOP_ALL = 1, LOOP_ONE = 2 };
 
 static char dirpath[NAME_LEN];
@@ -67,7 +104,7 @@ static unsigned char inbuf[IN_BUF_SIZE];
 static int inpos = 0, inend = 0;
 static int at_eof = 0;
 
-static short pcm[2304];               // one MP3 frame: 2 granules * 2 ch * 576
+static short pcm[2304] __attribute__((aligned(4)));   // one MP3 frame: 2 granules * 2 ch * 576
 static int pcm_frames = 0;            // sample frames in pcm[]
 static int pcm_pos = 0;
 static int channels = 2;
@@ -76,7 +113,7 @@ static int bitrate = 128000;
 static long file_size = 0, data_start = 0;
 static unsigned total_sec = 0;
 
-static short ring[RING_FRAMES * 2];   // stereo ring buffer
+static short ring[RING_FRAMES * 2] __attribute__((aligned(4)));   // stereo ring buffer
 static volatile unsigned wr = 0;      // written by the main loop only
 static volatile unsigned rd = 0;      // written by the audio callback only
 static volatile int decoder_done = 0;
@@ -160,27 +197,40 @@ static int decode_next(void)
     }
 }
 
-// Main loop: keep the ring buffer topped up (a few frames per call).
+// Main loop: keep the ring buffer topped up. Decoding one MP3 frame is the
+// biggest single job, so the main loop decides how many to allow per pass.
+static int pump_budget = PUMP_FRAMES;
+
 static void pump(void)
 {
     if (!playing || decoder_done || !mp3f || !hdec) return;
 
     int decoded = 0;
     for (;;) {
-        // move pending samples into the ring
-        while (pcm_pos < pcm_frames && (wr - rd) < RING_FRAMES) {
-            unsigned i = wr & RING_MASK;
+        // move pending samples into the ring: one 32-bit copy per stereo sample
+        unsigned w = wr;
+        unsigned room = RING_FRAMES - (w - rd);
+        unsigned n = (unsigned)(pcm_frames - pcm_pos);
+        if (n > room) n = room;
+        if (n) {
+            u32 *dst = (u32 *)ring;
+            unsigned i = w & RING_MASK;
             if (channels == 2) {
-                ring[2 * i]     = pcm[2 * pcm_pos];
-                ring[2 * i + 1] = pcm[2 * pcm_pos + 1];
+                const u32 *src = (const u32 *)pcm + pcm_pos;
+                for (unsigned k = 0; k < n; k++) { dst[i] = src[k]; i = (i + 1) & RING_MASK; }
             } else {
-                ring[2 * i] = ring[2 * i + 1] = pcm[pcm_pos];
+                const short *src = pcm + pcm_pos;
+                for (unsigned k = 0; k < n; k++) {
+                    u32 v = (u16)src[k];
+                    dst[i] = v | (v << 16);
+                    i = (i + 1) & RING_MASK;
+                }
             }
-            pcm_pos++;
-            wr++;
+            pcm_pos += (int)n;
+            wr = w + n;
         }
         if (pcm_pos < pcm_frames) return;            // ring is full
-        if (decoded >= PUMP_FRAMES) return;
+        if (decoded >= pump_budget) return;
         if ((RING_FRAMES - (wr - rd)) < 1152) return; // no room for a frame yet
 
         if (!decode_next()) { decoder_done = 1; return; }
@@ -452,8 +502,12 @@ static void flush_one(const u16 *src, u16 *dst, int *d0, int *d1)
     if (*d0 >= *d1 || !dst) return;
     const u32 *s = (const u32 *)(src + *d0 * SW);
     u32 *d = (u32 *)(dst + *d0 * SW);
-    int n = (*d1 - *d0) * SW / 2;
-    while (n-- > 0) *d++ = *s++;     // 32-bit writes only (VRAM ignores 8-bit)
+    int n = (*d1 - *d0) * SW / 2;                 // always a multiple of 8 words (128 per row)
+    for (; n >= 8; n -= 8) {                      // 8 words per step: ldm/stm burst copies
+        u32 a0 = s[0], a1 = s[1], a2 = s[2], a3 = s[3], a4 = s[4], a5 = s[5], a6 = s[6], a7 = s[7];
+        d[0] = a0; d[1] = a1; d[2] = a2; d[3] = a3; d[4] = a4; d[5] = a5; d[6] = a6; d[7] = a7;
+        s += 8; d += 8;
+    }
     *d0 = SH; *d1 = 0;
 }
 
@@ -1879,9 +1933,16 @@ static void fill_rect(u16 *fb, int x, int y, int w, int h, u16 c)
     if (x1 > SW) x1 = SW;
     if (y1 > SH) y1 = SH;
     mark(fb, y, y1);
+    int w0 = x1 - x;
+    if (w0 <= 0) return;
+    u32 cc = (u32)c | ((u32)c << 16);
     for (int j = y; j < y1; j++) {
         u16 *p = fb + j * SW + x;
-        for (int i = x; i < x1; i++) *p++ = c;
+        int n = w0;
+        if (((unsigned)(size_t)p & 2) && n) { *p++ = c; n--; }       // 32-bit writes: half the work
+        u32 *q = (u32 *)p;
+        for (; n >= 2; n -= 2) *q++ = cc;
+        if (n) *(u16 *)q = c;
     }
 }
 
@@ -2139,6 +2200,7 @@ static int bcnt;
 
 static void service_audio(void)
 {
+    pump_budget = PUMP_FRAMES;
     pump();
     mmStreamUpdate();
 }
@@ -3562,11 +3624,11 @@ static int lyr_find(unsigned ms)             // index of the line to show now, o
 
 #define VIZ_BANDS  16
 #define VIZ_N      512
-#define VQ         16                    // snapshots kept, to delay the bars like the audio
-#define VIZ_DELAY  7                     // in video frames
+#define VQ         4                     // snapshots kept, to delay the bars like the audio
 #define VIZ_MAXH   88
 
 static short vq[VQ][VIZ_N];
+static unsigned vq_n = 0;
 static short viz_win[VIZ_N];
 static int viz_h[VIZ_BANDS], viz_pk[VIZ_BANDS];
 static int viz_dh[VIZ_BANDS], viz_dpk[VIZ_BANDS];     // what is drawn right now
@@ -3598,15 +3660,17 @@ static void viz_prepare(int rate)
     }
 }
 
-// every frame: remember the audio that the ring buffer is about to play
+// Remember the audio that the ring buffer is about to play (called when the bars update).
 static void viz_snapshot(void)
 {
-    short *dst = vq[tick % VQ];
+    short *dst = vq[vq_n % VQ];
+    vq_n++;
     unsigned r = rd;
     if (playing && !paused && (wr - r) >= VIZ_N) {
+        const u32 *rg = (const u32 *)ring;
         for (int i = 0; i < VIZ_N; i++) {
-            unsigned k = (r + (unsigned)i) & RING_MASK;
-            dst[i] = (short)((ring[2 * k] + ring[2 * k + 1]) >> 5);      // mono, +-1024
+            u32 v = rg[(r + (unsigned)i) & RING_MASK];
+            dst[i] = (short)(((int)(short)v + (int)(short)(v >> 16)) >> 5);     // mono, +-1024
         }
     } else {
         memset(dst, 0, sizeof vq[0]);
@@ -3623,9 +3687,14 @@ static int viz_log4(long long p)                        // 4 * log2(p)
 }
 
 // Returns 1 if the bars moved.
-static int viz_update(void)
+static int viz_update(unsigned dt_ms, unsigned interval_ms)
 {
-    const short *x = vq[(tick + VQ - VIZ_DELAY) % VQ];
+    unsigned lag = 120 / (interval_ms ? interval_ms : 50);        // show what is audible now, not what is queued
+    if (lag < 1) lag = 1;
+    if (lag > VQ - 1) lag = VQ - 1;
+    const short *x = vq[(vq_n + VQ * 2 - 1 - lag) % VQ];
+    int fall = (int)(5 * dt_ms / 50);                             // bars fall at the same speed at any frame rate
+    if (fall < 1) fall = 1;
     int w[VIZ_N], any = 0;
     for (int i = 0; i < VIZ_N; i++) { w[i] = (x[i] * viz_win[i]) >> 15; if (w[i]) any = 1; }
 
@@ -3645,9 +3714,9 @@ static int viz_update(void)
             if (target > VIZ_MAXH) target = VIZ_MAXH;
         }
         if (target >= viz_h[b]) viz_h[b] = (viz_h[b] + target * 3) / 4;
-        else { viz_h[b] -= 5; if (viz_h[b] < target) viz_h[b] = target; }
+        else { viz_h[b] -= fall; if (viz_h[b] < target) viz_h[b] = target; }
         if (viz_h[b] >= viz_pk[b]) viz_pk[b] = viz_h[b];
-        else if (viz_pk[b] > 0) viz_pk[b]--;
+        else if (viz_pk[b] > 0) { viz_pk[b] -= (int)(dt_ms / 50) + 1; if (viz_pk[b] < 0) viz_pk[b] = 0; }
     }
     int changed = 0;
     for (int b = 0; b < VIZ_BANDS; b++)
@@ -3898,12 +3967,20 @@ static void album_label(char *dst, size_t cap, const char *src)
 static void draw_cover(u16 *fb, int x0, int y0, int s)
 {
     int pic = (sh_s > 0 && nfiles > 0);
+    if (s > 96) s = 96;
+    if (x0 < 0 || y0 < 0 || x0 + s > SW || y0 + s > SH) return;
+    int xs[96];
+    u16 gt[192];
+    if (pic) for (int i = 0; i < s; i++) xs[i] = i * sh_s / s;
+    else     for (int d = 0; d < 2 * s; d++) gt[d] = lerp3(cov1, cov2, d * 256 / (2 * s));
+    mark(fb, y0, y0 + s);
     for (int j = 0; j < s; j++) {
-        for (int i = 0; i < s; i++) {
-            u16 c;
-            if (pic) c = sh_pix[(j * sh_s / s) * sh_s + (i * sh_s / s)];
-            else     c = lerp3(cov1, cov2, (i + j) * 256 / (2 * s));
-            putpx(fb, x0 + i, y0 + j, c);
+        u16 *dst = fb + (y0 + j) * SW + x0;
+        if (pic) {
+            const u16 *src = sh_pix + (j * sh_s / s) * sh_s;
+            for (int i = 0; i < s; i++) dst[i] = src[xs[i]];
+        } else {
+            for (int i = 0; i < s; i++) dst[i] = gt[i + j];
         }
     }
     // round the corners by painting the screen background back
@@ -4096,7 +4173,7 @@ static void draw_eq(int x, int y, int active)
     for (int i = 0; i < 3; i++) {
         int h = 4;
         if (active) {
-            int t = (int)((tick / 4 + ph[i] * 3 + i * 7) % 16);
+            int t = (int)((vtick / 4 + (unsigned)(ph[i] * 3 + i * 7)) % 16);
             h = 3 + (t < 8 ? t : 15 - t);
         }
         fill_rect(fbB, x + i * 4, y + 12 - h, 3, h, C_GREEN);
@@ -4275,6 +4352,9 @@ int main(int argc, char **argv)
 #endif
     mmInit(&sys);
 
+    KOI_SCFG_CLK |= 1;               // DSi: 134 MHz CPU (no effect on a DS)
+    time_init();
+
     strcpy(dirpath, "/");
     if (fatInitDefault()) {
         if (argc > 0 && argv[0]) {
@@ -4311,17 +4391,29 @@ int main(int argc, char **argv)
     refresh_all();
     flush_screens();
 
+    unsigned now = now_ms(), t_prog = now, t_eq = now, t_viz = now, t_frame = now;
+    unsigned viz_interval = 50;      // bars update 20 times a second (10 if the CPU is struggling)
+    int frames = 0, slow = 0, combine = 0;
+
     while (pmMainLoop()) {
-        pump();
         mmStreamUpdate();
         swiWaitForVBlank();
-        flush_screens();             // show what was drawn last frame, tear-free
+        flush_screens();             // show what was drawn last pass, tear-free
         tick++;
-
-        if (jactive) {               // embedded cover art is decoded a little every frame
-            if (jp_step(64) == 1) { adopt_cover(2); cover_changed = 1; }
+        now = now_ms();
+        vtick = now * 3u / 50u;
+        {   // if many passes take longer than a frame, slow the bars down a little
+            unsigned dt = now - t_frame;
+            t_frame = now;
+            if (dt > 24) slow++;
+            if (++frames >= 60) {
+                // Decoding alone takes longer than a frame: passes are long anyway, so drawing is
+                // squeezed into the same pass as the decode instead of costing extra passes.
+                combine = slow > 20;
+                viz_interval = combine ? 100 : 50;
+                frames = slow = 0;
+            }
         }
-        viz_snapshot();
 
         scanKeys();
         u32 down = keysDown();
@@ -4403,25 +4495,48 @@ int main(int argc, char **argv)
             full = 1; recenter = 1;
         }
 
+        // ---- drawing that follows from what just happened
+        int heavy = 0;
         if (full) {
             if (recenter) center_view_on_current();
             refresh_all();
+            heavy = 1;
         } else {
-            if (cover_changed || topd) { cover_changed = 0; pick_colours(); draw_top_full(); }
-            if (listd) draw_list();
+            if (cover_changed || topd) { cover_changed = 0; pick_colours(); draw_top_full(); heavy = 1; }
+            if (listd) { draw_list(); heavy = 1; }
             if (ctrl)  draw_controls();
             if (!topd && (listd || ctrl)) draw_progress();
             if (nfiles > 0 && !listd && !ctrl) {
-                if ((tick % 20) == 0) draw_progress();
-                if ((tick % 5) == 0) eq_refresh();
+                if (now - t_eq >= 80)    { t_eq = now;   eq_refresh(); }
+                if (now - t_prog >= 500) { t_prog = now; draw_progress(); }
             }
-            if (nfiles > 0) {
-                if (lyr_view) {
-                    if (playing && lyr_find(elapsed_ms()) != lyr_shown) draw_lyrics();
-                } else if ((tick & 1) == 0 && viz_update()) {
-                    draw_viz();
-                }
+        }
+
+        // ---- at most one big job per pass, so a frame is never both decoding and drawing:
+        unsigned fill = wr - rd;
+        if (playing && fill < RING_FRAMES / 6) {             // 1. audio is running low: always first
+            pump_budget = 2;
+            pump();
+            heavy = 1;
+        }
+        if (!heavy && jactive) {                             // 2. cover art, one slice at a time
+            if (jp_step(64) == 1) { adopt_cover(2); cover_changed = 1; }
+            heavy = 1;
+        }
+        if (!heavy && nfiles > 0) {                          // 3. lyrics line / visualizer bars
+            if (lyr_view) {
+                if (playing && lyr_find(elapsed_ms()) != lyr_shown) { draw_lyrics(); heavy = 1; }
+            } else if (now - t_viz >= viz_interval) {
+                unsigned dtv = now - t_viz;
+                t_viz = now;
+                viz_snapshot();
+                if (viz_update(dtv, viz_interval)) draw_viz();
+                heavy = 1;
             }
+        }
+        if (combine || !heavy || fill < (RING_FRAMES * 3) / 8) {   // 4. otherwise decode music
+            pump_budget = 1;
+            pump();
         }
     }
 
