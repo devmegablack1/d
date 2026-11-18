@@ -25,6 +25,12 @@
 #include <unistd.h>
 
 #include "mp3dec.h"
+#include <errno.h>
+#include <dswifi9.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <netinet/in.h>
+#include <netdb.h>
 
 #define MAX_FILES    256
 #define MAX_ALBUMS   128
@@ -547,6 +553,8 @@ static void flush_screens(void)
 
 // geometry of the bottom screen
 #define LIST_Y      24
+#define SYNC_X      142
+#define SYNC_W      58
 #define ROW_H       24
 #define ROWS_VIS    5
 #define PANEL_Y     148
@@ -4463,6 +4471,8 @@ static void draw_row(int idx)
     }
 }
 
+static void draw_pill(int x, int y, const char *label, int w, int on);
+
 static void draw_list(void)
 {
     fill_rect(fbB, 0, 0, SW, PANEL_Y, C_BG);
@@ -4470,6 +4480,7 @@ static void draw_list(void)
 
     if (browse < 0) {
         draw_text(fbB, &F_LG, 10, 2, "Your Library", C_WHITE);
+        draw_pill(SYNC_X, 3, "SYNC", SYNC_W, 0);
     } else {
         tri_left(fbB, 10, 6, 9, 13, C_WHITE);
         char nm[NAME_LEN], shown[NAME_LEN + 4];
@@ -4486,6 +4497,7 @@ static void draw_list(void)
         if (browse < 0) {
             draw_text(fbB, &F_MD, 10, 50, "Nothing here yet.", C_GREY);
             draw_text(fbB, &F_SM, 10, 68, "Copy .mp3 files or folders next to this app.", C_DIM);
+            draw_text(fbB, &F_SM, 10, 84, "Or tap SYNC to download from your server.", C_DIM);
         } else {
             draw_text(fbB, &F_MD, 10, 50, "No songs in this album.", C_GREY);
         }
@@ -4535,6 +4547,743 @@ static void draw_bottom_full(void)
 {
     draw_list();
     draw_controls();
+}
+
+// ------------------------------------------------------------ online sync (WiFi)
+//
+// Press START (or tap SYNC) in the library: the app joins the WiFi connection saved in the
+// console's settings, downloads albums.json from your server (plain http), and copies every
+// song / cover that is missing (or has a different size) onto the SD card. Then the library is
+// reloaded. Server address: koi.cfg next to the app ("server=music.example.com", optional
+// "path=/music/" and "port=80"). Without koi.cfg the built-in address below is used.
+
+static char sy_host[96] = "music.wegonbeok.com";
+static char sy_base[96] = "/";
+static int  sy_port = 80;
+static char sy_msg[120];                 // last problem, shown on the result screen
+static int  sy_cancelled = 0;
+
+static int    sy_mode = 0;               // 0 = only count the files, 1 = download
+static int    sy_total = 0, sy_idx = 0, sy_new = 0, sy_skip = 0, sy_fail = 0, sy_streak = 0;
+static long   sy_cur_bytes = 0, sy_cur_total = 0;
+static unsigned long long sy_bytes_all = 0;
+static unsigned sy_t0 = 0, sy_t_ui = 0;
+static char   sy_cur_name[NAME_LEN] = "";
+static const char *sy_head = "Syncing";
+static char   sy_buf[16384] __attribute__((aligned(4)));
+
+static void sy_fmt(char *dst, size_t cap, unsigned long long b)
+{
+    if (b < 1024ull * 1024ull) snprintf(dst, cap, "%u KB", (unsigned)((b + 1023) / 1024));
+    else snprintf(dst, cap, "%u.%u MB", (unsigned)(b / (1024ull * 1024ull)), (unsigned)((b % (1024ull * 1024ull)) * 10 / (1024ull * 1024ull)));
+}
+
+static void sy_screen(const char *head, const char *a, const char *b, const char *c, int permille, const char *foot)
+{
+    fill_rect(fbT, 0, 0, SW, SH, C_BG);
+    fill_rect(fbB, 0, 0, SW, SH, C_BG);
+    char t[NAME_LEN + 8];
+    draw_text(fbT, &F_LG, 16, 20, head, C_WHITE);
+    if (a && a[0]) { fit_text(t, sizeof t, &F_MD, a, 224); draw_text(fbT, &F_MD, 16, 62, t, C_WHITE); }
+    if (b && b[0]) { fit_text(t, sizeof t, &F_SM, b, 224); draw_text(fbT, &F_SM, 16, 90, t, C_GREY); }
+    if (c && c[0]) { fit_text(t, sizeof t, &F_SM, c, 224); draw_text(fbT, &F_SM, 16, 106, t, C_GREY); }
+    if (permille >= 0) {
+        if (permille > 1000) permille = 1000;
+        fill_rrect(fbT, 16, 134, 224, 6, 3, C_TRACK);
+        int w = 224 * permille / 1000;
+        if (w > 0) fill_rrect(fbT, 16, 134, w < 6 ? 6 : w, 6, 3, C_GREEN);
+    }
+    if (foot && foot[0]) draw_text(fbT, &F_SM, 16, 156, foot, C_DIM);
+    draw_text_right(fbT, &F_SB, 240, 178, "made by koi", C_GREEN);
+    draw_text(fbB, &F_MD, 16, 80, "Online sync", C_GREY);
+    draw_text(fbB, &F_SM, 16, 100, "Hold B to cancel.", C_DIM);
+    flush_screens();
+}
+
+static int sy_cancel(void)
+{
+    scanKeys();
+    return (keysHeld() & KEY_B) != 0;
+}
+
+static void sy_ui(int force)
+{
+    unsigned now = now_ms();
+    if (!force && now - sy_t_ui < 250) return;
+    sy_t_ui = now;
+    char b[64], c[96], sz1[16], sz2[16], sp[16];
+    snprintf(b, sizeof b, "File %d of %d   -   %d new, %d up to date", sy_idx, sy_total, sy_new, sy_skip);
+    sy_fmt(sz1, sizeof sz1, (unsigned long long)sy_cur_bytes);
+    unsigned el = now - sy_t0;
+    if (el < 500) el = 500;
+    sy_fmt(sp, sizeof sp, sy_bytes_all * 1000ull / el);
+    if (sy_cur_total > 0) {
+        sy_fmt(sz2, sizeof sz2, (unsigned long long)sy_cur_total);
+        snprintf(c, sizeof c, "%s of %s   (%s/s)", sz1, sz2, sp);
+    } else {
+        snprintf(c, sizeof c, "%s   (%s/s)", sz1, sp);
+    }
+    int pm = sy_cur_total > 0 ? (int)((unsigned long long)sy_cur_bytes * 1000ull / (unsigned long long)sy_cur_total) : -1;
+    sy_screen(sy_head, sy_cur_name, b, c, pm, "Hold B to cancel");
+}
+
+// ---- small helpers
+
+static void sy_safe(char *dst, size_t cap, const char *src)
+{
+    size_t n = 0;
+    for (; *src && n + 1 < cap; src++) {
+        unsigned char ch = (unsigned char)*src;
+        dst[n++] = (ch < 0x20 || strchr("<>:\"/\\|?*", ch)) ? '_' : (char)ch;
+    }
+    while (n > 0 && (dst[n - 1] == ' ' || dst[n - 1] == '.')) n--;
+    if (n == 0) dst[n++] = '_';
+    dst[n] = 0;
+}
+
+static int sy_hexv(int c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static void sy_unescape(char *dst, size_t cap, const char *src)
+{
+    size_t n = 0;
+    while (*src && n + 1 < cap) {
+        if (src[0] == '%' && sy_hexv(src[1]) >= 0 && sy_hexv(src[2]) >= 0) {
+            dst[n++] = (char)(sy_hexv(src[1]) * 16 + sy_hexv(src[2]));
+            src += 3;
+        } else dst[n++] = *src++;
+    }
+    dst[n] = 0;
+}
+
+// "/music/" + "A b/c.mp3" -> "/music/A%20b/c.mp3" (already-encoded parts are kept)
+static void sy_urlpath(char *dst, size_t cap, const char *upath)
+{
+    size_t n = 0;
+    const char *b = sy_base;
+    while (*b && n + 1 < cap) dst[n++] = *b++;
+    if (n == 0 || dst[n - 1] != '/') { if (n + 1 < cap) dst[n++] = '/'; }
+    while (*upath == '/') upath++;
+    static const char hexd[] = "0123456789ABCDEF";
+    for (; *upath && n + 4 < cap; upath++) {
+        unsigned char ch = (unsigned char)*upath;
+        if ((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || strchr("-._~/%!$&'()*+,;=:@", ch)) dst[n++] = (char)ch;
+        else { dst[n++] = '%'; dst[n++] = hexd[ch >> 4]; dst[n++] = hexd[ch & 15]; }
+    }
+    dst[n] = 0;
+}
+
+static void sy_load_cfg(void)
+{
+    char p[NAME_LEN * 3];
+    join_path(p, sizeof p, dirpath, "koi.cfg");
+    FILE *f = fopen(p, "rb");
+    if (!f) return;
+    char ln[200];
+    while (fgets(ln, sizeof ln, f)) {
+        char *e = ln + strlen(ln);
+        while (e > ln && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
+        char *v = strchr(ln, '=');
+        if (!v) continue;
+        *v++ = 0;
+        while (*v == ' ') v++;
+        if (!strcasecmp(ln, "server") || !strcasecmp(ln, "host")) {
+            if (!strncasecmp(v, "http://", 7)) v += 7;
+            char *sl = strchr(v, '/');
+            if (sl) { snprintf(sy_base, sizeof sy_base, "%s", sl); *sl = 0; }
+            char *co = strchr(v, ':');
+            if (co) { *co = 0; sy_port = atoi(co + 1); }
+            if (*v) snprintf(sy_host, sizeof sy_host, "%s", v);
+        } else if (!strcasecmp(ln, "path")) {
+            if (*v) snprintf(sy_base, sizeof sy_base, "%s", v);
+        } else if (!strcasecmp(ln, "port")) {
+            if (atoi(v) > 0) sy_port = atoi(v);
+        }
+    }
+    fclose(f);
+}
+
+// ---- tiny HTTP/1.0 client (plain http; the DS cannot do https)
+
+typedef struct {
+    int fd, status;
+    long clen, got;
+    int chunked, body_done;
+    long chunk_left;
+    unsigned char pre[1536];
+    int pre_n, pre_p;
+} SyConn;
+
+static void sy_close(SyConn *c)
+{
+    if (c->fd >= 0) { shutdown(c->fd, 0); closesocket(c->fd); c->fd = -1; }
+}
+
+// >0 bytes, 0 = connection closed, -1 = problem (sy_msg says which)
+static int sy_recv(SyConn *c, void *dst, int n)
+{
+    if (c->pre_p < c->pre_n) {
+        int k = c->pre_n - c->pre_p;
+        if (k > n) k = n;
+        memcpy(dst, c->pre + c->pre_p, (size_t)k);
+        c->pre_p += k;
+        return k;
+    }
+    unsigned t0 = now_ms();
+    for (;;) {
+        errno = 0;
+        int r = (int)recv(c->fd, dst, (size_t)n, 0);
+        if (r > 0) return r;
+        if (r == 0) return 0;
+        int e = errno;
+        if (e != 0 && e != EWOULDBLOCK && e != EAGAIN && e != EINTR) {
+            snprintf(sy_msg, sizeof sy_msg, "Connection lost (error %d)", e);
+            return -1;
+        }
+        if (now_ms() - t0 > 20000) { snprintf(sy_msg, sizeof sy_msg, "The server stopped answering"); return -1; }
+        if (sy_cancel()) { sy_cancelled = 1; snprintf(sy_msg, sizeof sy_msg, "Cancelled"); return -1; }
+        swiWaitForVBlank();
+    }
+}
+
+static int sy_open(SyConn *c, const char *url)
+{
+    memset(c, 0, sizeof *c);
+    c->fd = -1;
+    c->clen = -1;
+    sy_msg[0] = 0;
+
+    struct hostent *h = gethostbyname(sy_host);
+    if (!h || !h->h_addr_list || !h->h_addr_list[0]) {
+        snprintf(sy_msg, sizeof sy_msg, "Can't find %s (DNS)", sy_host);
+        return 0;
+    }
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { snprintf(sy_msg, sizeof sy_msg, "Can't open a network socket"); return 0; }
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((unsigned short)sy_port);
+    memcpy(&sa.sin_addr, h->h_addr_list[0], 4);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0) {
+        closesocket(fd);
+        snprintf(sy_msg, sizeof sy_msg, "Can't reach %s", sy_host);
+        return 0;
+    }
+    static char req[900];
+    int rl = snprintf(req, sizeof req,
+        "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: koi-ds\r\nAccept: */*\r\nConnection: close\r\n\r\n", url, sy_host);
+    int sent = 0;
+    while (sent < rl) {
+        int r = (int)send(fd, req + sent, (size_t)(rl - sent), 0);
+        if (r <= 0) { closesocket(fd); snprintf(sy_msg, sizeof sy_msg, "Couldn't send the request"); return 0; }
+        sent += r;
+    }
+    int one = 1;
+    ioctl(fd, FIONBIO, &one);                      // from here on we poll, so B can cancel
+    c->fd = fd;
+
+    static char hb[1536];
+    int hl = 0, hend = -1;
+    while (hend < 0) {
+        int room = (int)sizeof hb - 1 - hl;
+        if (room <= 0) { snprintf(sy_msg, sizeof sy_msg, "Unexpected answer from the server"); sy_close(c); return 0; }
+        int r = sy_recv(c, hb + hl, room);
+        if (r <= 0) {
+            if (!sy_msg[0]) snprintf(sy_msg, sizeof sy_msg, "No answer from the server");
+            sy_close(c);
+            return 0;
+        }
+        hl += r;
+        hb[hl] = 0;
+        char *e = strstr(hb, "\r\n\r\n");
+        if (e) hend = (int)(e - hb) + 4;
+    }
+    c->pre_n = hl - hend;
+    if (c->pre_n > 0) memcpy(c->pre, hb + hend, (size_t)c->pre_n);
+    c->pre_p = 0;
+    hb[hend - 2] = 0;                              // headers end here
+
+    int major = 0, minor = 0;
+    if (sscanf(hb, "HTTP/%d.%d %d", &major, &minor, &c->status) != 3) {
+        snprintf(sy_msg, sizeof sy_msg, "Unexpected answer from the server");
+        sy_close(c);
+        return 0;
+    }
+    char loc[96] = "";
+    for (char *ln = strstr(hb, "\r\n"); ln; ln = strstr(ln + 2, "\r\n")) {
+        const char *l = ln + 2;
+        if (!strncasecmp(l, "content-length:", 15)) c->clen = atol(l + 15);
+        else if (!strncasecmp(l, "transfer-encoding:", 18)) {
+            for (const char *q = l + 18; *q && *q != '\r'; q++) if (!strncasecmp(q, "chunked", 7)) { c->chunked = 1; break; }
+        }
+        else if (!strncasecmp(l, "location:", 9)) {
+            l += 9;
+            while (*l == ' ') l++;
+            size_t k = 0;
+            while (l[k] && l[k] != '\r' && k < sizeof loc - 1) { loc[k] = l[k]; k++; }
+            loc[k] = 0;
+        }
+    }
+    if (c->status != 200) {
+        if (c->status >= 300 && c->status < 400) {
+            if (!strncasecmp(loc, "https:", 6))
+                snprintf(sy_msg, sizeof sy_msg, "Server forces https - turn off Always Use HTTPS");
+            else
+                snprintf(sy_msg, sizeof sy_msg, "Server redirects (%d) - check koi.cfg", c->status);
+        } else if (c->status == 404) snprintf(sy_msg, sizeof sy_msg, "Not found on the server (404)");
+        else snprintf(sy_msg, sizeof sy_msg, "Server answered %d", c->status);
+        sy_close(c);
+        return 0;
+    }
+    return 1;
+}
+
+// body bytes: >0 data, 0 = finished, -1 = problem
+static int sy_body(SyConn *c, void *dst, int n)
+{
+    if (c->body_done) return 0;
+    if (c->chunked) {
+        while (c->chunk_left == 0) {
+            char ln[24];
+            int k = 0;
+            for (;;) {
+                unsigned char ch;
+                int r = sy_recv(c, &ch, 1);
+                if (r <= 0) {
+                    if (r == 0) snprintf(sy_msg, sizeof sy_msg, "Download cut off");
+                    return -1;
+                }
+                if (ch == '\n') break;
+                if (ch != '\r' && k < 23) ln[k++] = (char)ch;
+            }
+            if (k == 0) continue;                  // blank line between chunks
+            ln[k] = 0;
+            long sz = strtol(ln, NULL, 16);
+            if (sz <= 0) { c->body_done = 1; return 0; }
+            c->chunk_left = sz;
+        }
+        if (n > c->chunk_left) n = (int)c->chunk_left;
+        int r = sy_recv(c, dst, n);
+        if (r == 0) { snprintf(sy_msg, sizeof sy_msg, "Download cut off"); return -1; }
+        if (r < 0) return -1;
+        c->chunk_left -= r;
+        c->got += r;
+        return r;
+    }
+    if (c->clen >= 0) {
+        long rem = c->clen - c->got;
+        if (rem <= 0) { c->body_done = 1; return 0; }
+        if (n > rem) n = (int)rem;
+    }
+    int r = sy_recv(c, dst, n);
+    if (r > 0) { c->got += r; return r; }
+    if (r == 0) {
+        if (c->clen >= 0 && c->got < c->clen) { snprintf(sy_msg, sizeof sy_msg, "Download cut off"); return -1; }
+        c->body_done = 1;
+        return 0;
+    }
+    return -1;
+}
+
+// Download one file from the server into dest (via dest.part). expect = size from albums.json or 0.
+static int sy_get(const char *upath, const char *dest, long expect)
+{
+    static char url[760];
+    sy_urlpath(url, sizeof url, upath);
+    static SyConn c;
+    sy_cancelled = 0;
+    if (!sy_open(&c, url)) return 0;
+
+    static char part[NAME_LEN * 3 + 8];
+    snprintf(part, sizeof part, "%s.part", dest);
+    FILE *f = fopen(part, "wb");
+    if (!f) { snprintf(sy_msg, sizeof sy_msg, "Can't write to the SD card"); sy_close(&c); return 0; }
+
+    sy_cur_bytes = 0;
+    sy_cur_total = c.clen >= 0 ? c.clen : expect;
+    long got = 0;
+    int fill = 0, ok = 1;
+    for (;;) {
+        int r = sy_body(&c, sy_buf + fill, (int)sizeof sy_buf - fill);
+        if (r < 0) { ok = 0; break; }
+        if (r == 0) break;
+        fill += r;
+        got += r;
+        sy_cur_bytes = got;
+        sy_bytes_all += (unsigned)r;
+        if (fill >= 8192) {
+            if (fwrite(sy_buf, 1, (size_t)fill, f) != (size_t)fill) { snprintf(sy_msg, sizeof sy_msg, "SD card full or write error"); ok = 0; break; }
+            fill = 0;
+        }
+        sy_ui(0);
+    }
+    if (ok && fill > 0 && fwrite(sy_buf, 1, (size_t)fill, f) != (size_t)fill) { snprintf(sy_msg, sizeof sy_msg, "SD card full or write error"); ok = 0; }
+    fclose(f);
+    sy_close(&c);
+    if (ok && expect > 0 && got != expect) {
+        snprintf(sy_msg, sizeof sy_msg, "Size differs from albums.json - rebuild it");
+        ok = 0;
+    }
+    if (!ok) { remove(part); return 0; }
+    remove(dest);
+    if (rename(part, dest) != 0) { snprintf(sy_msg, sizeof sy_msg, "Couldn't save the file"); remove(part); return 0; }
+    return 1;
+}
+
+// ---- streaming reader for albums.json
+
+typedef struct { FILE *f; unsigned char buf[512]; int n, p; } Jr;
+enum { J_EOF = 0, J_STR = 1, J_NUM = 2, J_LIT = 3, J_LB = '{', J_RB = '}', J_LS = '[', J_RS = ']', J_COLON = ':', J_COMMA = ',' };
+static char jr_str[600];
+static long jr_num;
+static int  jr_lit;
+
+static int jr_getc(Jr *j)
+{
+    if (j->p >= j->n) {
+        j->n = (int)fread(j->buf, 1, sizeof j->buf, j->f);
+        j->p = 0;
+        if (j->n <= 0) { j->n = 0; return -1; }
+    }
+    return j->buf[j->p++];
+}
+
+static void jr_put8(size_t *n, unsigned cp)
+{
+    if (*n + 5 >= sizeof jr_str) return;
+    if (cp < 0x80) jr_str[(*n)++] = (char)cp;
+    else if (cp < 0x800) { jr_str[(*n)++] = (char)(0xC0 | (cp >> 6)); jr_str[(*n)++] = (char)(0x80 | (cp & 63)); }
+    else if (cp < 0x10000) { jr_str[(*n)++] = (char)(0xE0 | (cp >> 12)); jr_str[(*n)++] = (char)(0x80 | ((cp >> 6) & 63)); jr_str[(*n)++] = (char)(0x80 | (cp & 63)); }
+    else { jr_str[(*n)++] = (char)(0xF0 | (cp >> 18)); jr_str[(*n)++] = (char)(0x80 | ((cp >> 12) & 63)); jr_str[(*n)++] = (char)(0x80 | ((cp >> 6) & 63)); jr_str[(*n)++] = (char)(0x80 | (cp & 63)); }
+}
+
+static int jr_hex4(Jr *j)
+{
+    int v = 0;
+    for (int i = 0; i < 4; i++) {
+        int h = sy_hexv(jr_getc(j));
+        if (h < 0) return -1;
+        v = v * 16 + h;
+    }
+    return v;
+}
+
+static int jr_next(Jr *j)
+{
+    int c;
+    do c = jr_getc(j); while (c == ' ' || c == '\n' || c == '\r' || c == '\t' || c == 0xEF || c == 0xBB || c == 0xBF);
+    if (c < 0) return J_EOF;
+    if (c == '{' || c == '}' || c == '[' || c == ']' || c == ':' || c == ',') return c;
+    if (c == '"') {
+        size_t n = 0;
+        for (;;) {
+            c = jr_getc(j);
+            if (c < 0) return J_EOF;
+            if (c == '"') break;
+            if (c == '\\') {
+                c = jr_getc(j);
+                if (c == 'u') {
+                    int u = jr_hex4(j);
+                    if (u < 0) return J_EOF;
+                    if (u >= 0xD800 && u < 0xDC00) {                 // surrogate pair
+                        int c1 = jr_getc(j), c2 = jr_getc(j);
+                        int lo = -1;
+                        if (c1 == '\\' && c2 == 'u') lo = jr_hex4(j);
+                        if (lo >= 0xDC00 && lo < 0xE000) u = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
+                        else u = '?';
+                    }
+                    jr_put8(&n, (unsigned)u);
+                    continue;
+                }
+                if (c == 'n') c = '\n'; else if (c == 't') c = '\t'; else if (c == 'r') c = '\r';
+                else if (c == 'b') c = '\b'; else if (c == 'f') c = '\f';
+                if (c < 0) return J_EOF;
+            }
+            if (n + 1 < sizeof jr_str) jr_str[n++] = (char)c;
+        }
+        jr_str[n] = 0;
+        return J_STR;
+    }
+    if (c == '-' || (c >= '0' && c <= '9')) {
+        char nb[24];
+        int k = 0;
+        do {
+            if (k < 23) nb[k++] = (char)c;
+            c = jr_getc(j);
+        } while (c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' || (c >= '0' && c <= '9'));
+        if (c >= 0) j->p--;
+        nb[k] = 0;
+        jr_num = atol(nb);
+        return J_NUM;
+    }
+    if (c >= 'a' && c <= 'z') {
+        int first = c;
+        do c = jr_getc(j); while (c >= 'a' && c <= 'z');
+        if (c >= 0) j->p--;
+        jr_lit = (first == 't');
+        return J_LIT;
+    }
+    return J_EOF;
+}
+
+static int jr_skip(Jr *j, int t)
+{
+    if (t == J_EOF) return 0;
+    if (t == J_LB || t == J_LS) {
+        int d = 1;
+        while (d > 0) {
+            int u = jr_next(j);
+            if (u == J_EOF) return 0;
+            if (u == J_LB || u == J_LS) d++;
+            else if (u == J_RB || u == J_RS) d--;
+        }
+    }
+    return 1;
+}
+
+// One song / cover. Returns 0 to stop everything (cancelled / too many failures).
+static int sy_entry(const char *folder, int root, const char *upath, long size, const char *save_as)
+{
+    sy_idx++;
+    if (sy_mode == 0) { sy_total++; return 1; }
+
+    static char name[NAME_LEN], un[NAME_LEN];       // static: the DS stack is small
+    if (save_as && save_as[0]) sy_safe(name, sizeof name, save_as);
+    else {
+        const char *b = strrchr(upath, '/');
+        b = b ? b + 1 : upath;
+        sy_unescape(un, sizeof un, b);
+        sy_safe(name, sizeof name, un);
+    }
+    static char dir[NAME_LEN * 2], dest[NAME_LEN * 3];
+    if (root || !folder[0]) snprintf(dir, sizeof dir, "%s", dirpath);
+    else join_path(dir, sizeof dir, dirpath, folder);
+    join_path(dest, sizeof dest, dir, name);
+
+    struct stat st;
+    if (stat(dest, &st) == 0 && S_ISREG(st.st_mode) && (size <= 0 || (long)st.st_size == size)) {
+        sy_skip++;
+        sy_streak = 0;
+        sy_ui(0);
+        return 1;
+    }
+    if (stat(dir, &st) != 0) mkdir(dir, 0777);
+
+    snprintf(sy_cur_name, sizeof sy_cur_name, "%s", name);
+    sy_cur_bytes = 0;
+    sy_cur_total = size;
+    sy_ui(1);
+    if (sy_get(upath, dest, size)) {
+        sy_new++;
+        sy_streak = 0;
+    } else {
+        if (sy_cancelled) return 0;
+        sy_fail++;
+        if (++sy_streak >= 3) return 0;            // the connection is probably gone
+    }
+    return 1;
+}
+
+static int sy_files(Jr *j, const char *folder, int root)
+{
+    for (;;) {
+        int t = jr_next(j);
+        if (t == J_RS) return 1;
+        if (t == J_COMMA) continue;
+        if (t == J_STR) {
+            if (!sy_entry(folder, root, jr_str, 0, NULL)) return 0;
+        } else if (t == J_LB) {
+            static char path[420], save[NAME_LEN];
+            path[0] = save[0] = 0;
+            long size = 0;
+            for (;;) {
+                int u = jr_next(j);
+                if (u == J_RB) break;
+                if (u == J_COMMA) continue;
+                if (u != J_STR) return -1;
+                char key[24];
+                snprintf(key, sizeof key, "%s", jr_str);
+                if (jr_next(j) != J_COLON) return -1;
+                int v = jr_next(j);
+                if (!strcmp(key, "path") && v == J_STR) snprintf(path, sizeof path, "%s", jr_str);
+                else if (!strcmp(key, "save_as") && v == J_STR) snprintf(save, sizeof save, "%s", jr_str);
+                else if (!strcmp(key, "size") && v == J_NUM) size = jr_num;
+                else if (!jr_skip(j, v)) return -1;
+            }
+            if (path[0] && !sy_entry(folder, root, path, size, save[0] ? save : NULL)) return 0;
+        } else return -1;
+    }
+}
+
+// returns 1 = ok, 0 = stopped on purpose, -1 = bad file
+static int sy_album(Jr *j)
+{
+    static char nm[NAME_LEN], fo[NAME_LEN];
+    nm[0] = fo[0] = 0;
+    int root = 0;
+    for (;;) {
+        int t = jr_next(j);
+        if (t == J_RB) return 1;
+        if (t == J_COMMA) continue;
+        if (t != J_STR) return -1;
+        char key[24];
+        snprintf(key, sizeof key, "%s", jr_str);
+        if (jr_next(j) != J_COLON) return -1;
+        int v = jr_next(j);
+        if (!strcmp(key, "name") && v == J_STR) sy_safe(nm, sizeof nm, jr_str);
+        else if (!strcmp(key, "folder") && v == J_STR) sy_safe(fo, sizeof fo, jr_str);
+        else if (!strcmp(key, "root") && v == J_LIT) root = jr_lit;
+        else if (!strcmp(key, "cover") && v == J_STR) {
+            static char cp[420];
+            snprintf(cp, sizeof cp, "%s", jr_str);
+            if (!sy_entry(fo[0] ? fo : nm, root, cp, 0, "icon.png")) return 0;
+        } else if (!strcmp(key, "files") && v == J_LS) {
+            int r = sy_files(j, fo[0] ? fo : nm, root);
+            if (r <= 0) return r;
+        } else if (!jr_skip(j, v)) return -1;
+    }
+}
+
+static int sy_walk(const char *jsonpath)
+{
+    Jr *j = (Jr *)malloc(sizeof *j);
+    if (!j) return -1;
+    memset(j, 0, sizeof *j);
+    j->f = fopen(jsonpath, "rb");
+    if (!j->f) { free(j); return -1; }
+    int res = -1;
+    if (jr_next(j) == J_LB) {
+        res = 1;
+        for (;;) {
+            int t = jr_next(j);
+            if (t == J_RB) break;
+            if (t == J_COMMA) continue;
+            if (t != J_STR) { res = -1; break; }
+            char key[24];
+            snprintf(key, sizeof key, "%s", jr_str);
+            if (jr_next(j) != J_COLON) { res = -1; break; }
+            int v = jr_next(j);
+            if (!strcmp(key, "albums") && v == J_LS) {
+                for (;;) {
+                    int a = jr_next(j);
+                    if (a == J_RS) break;
+                    if (a == J_COMMA) continue;
+                    if (a != J_LB) { res = -1; break; }
+                    int r = sy_album(j);
+                    if (r <= 0) { res = r; break; }
+                }
+                if (res <= 0) break;
+            } else if (!jr_skip(j, v)) { res = -1; break; }
+        }
+    }
+    fclose(j->f);
+    free(j);
+    return res;
+}
+
+// ---- the whole sync
+
+static void sy_wait_key(void)
+{
+    while (pmMainLoop()) {
+        swiWaitForVBlank();
+        scanKeys();
+        if (keysDown() & (KEY_A | KEY_B | KEY_START | KEY_TOUCH)) break;
+    }
+}
+
+static void sy_reload_library(void)
+{
+    close_track();
+    nfiles = 0; cur = 0; play_album = -1; browse = -1; view_first = 0;
+    memset(albhas, 0, sizeof albhas);
+    scan_library();
+    strcpy(playdir, dirpath);
+    preload_covers();
+    preload_library();
+    if (nroot > 0) use_browse_as_playlist();       // ready to play, but does not start by itself
+}
+
+static int sy_wifi(void)
+{
+    sy_screen("Connecting", "Joining your WiFi...", "Uses the connection saved in", "the console's settings.", -1, "This can take up to 30 seconds");
+    if (!Wifi_InitDefault(WFC_CONNECT) || Wifi_AssocStatus() != ASSOCSTATUS_ASSOCIATED) {
+        snprintf(sy_msg, sizeof sy_msg, "Could not join WiFi");
+        return 0;
+    }
+    return 1;
+}
+
+static void sy_run(void)
+{
+    if (playing) close_track();                    // the radio and the decoder do not share the CPU well
+    sy_load_cfg();
+    sy_msg[0] = 0; sy_cancelled = 0;
+    sy_total = sy_idx = sy_new = sy_skip = sy_fail = sy_streak = 0;
+    sy_bytes_all = 0; sy_cur_bytes = sy_cur_total = 0; sy_cur_name[0] = 0;
+    sy_t0 = now_ms();
+
+    int stage = 0;                                 // 0 wifi, 1 list, 2 files, 3 finished
+    int result = 0;                                // 1 ok, 0 problem
+    static char jp[NAME_LEN * 3];
+    join_path(jp, sizeof jp, dirpath, ".koi_albums.json");
+
+    if (sy_wifi()) {
+        stage = 1;
+        sy_screen("Getting the list", sy_host, "albums.json", "", -1, "Hold B to cancel");
+        sy_mode = 1;
+        sy_cur_name[0] = 0;
+        if (sy_get("albums.json", jp, 0)) {
+            stage = 2;
+            sy_mode = 0; sy_idx = 0; sy_total = 0;
+            int r = sy_walk(jp);                   // pass 1: count
+            if (r < 0) { snprintf(sy_msg, sizeof sy_msg, "albums.json is not valid"); }
+            else {
+                sy_mode = 1; sy_idx = 0; sy_t0 = now_ms();
+                sy_head = "Downloading";
+                sy_walk(jp);                       // pass 2: download what is missing
+                stage = 3;
+                result = (sy_fail == 0 && !sy_cancelled);
+            }
+        }
+    }
+    remove(jp);
+    Wifi_DisconnectAP();
+
+    char l1[96], l2[96], l3[96];
+    l1[0] = l2[0] = l3[0] = 0;
+    const char *head = "Sync finished";
+    if (stage == 3 && result) {
+        snprintf(l1, sizeof l1, "%d new, %d already up to date", sy_new, sy_skip);
+        if (sy_new == 0) snprintf(l2, sizeof l2, "Everything is already on this card.");
+    } else if (stage == 3) {
+        head = sy_cancelled ? "Sync stopped" : "Sync finished with problems";
+        snprintf(l1, sizeof l1, "%d new, %d up to date, %d failed", sy_new, sy_skip, sy_fail);
+        snprintf(l2, sizeof l2, "%s", sy_msg[0] ? sy_msg : "Run sync again to retry.");
+    } else {
+        head = "Couldn't sync";
+        snprintf(l1, sizeof l1, "%s", sy_msg[0] ? sy_msg : "Something went wrong");
+        if (stage == 0) {
+            snprintf(l2, sizeof l2, "Save a WiFi connection in the DSi");
+            snprintf(l3, sizeof l3, "settings first (open, WEP or WPA2).");
+        } else if (stage == 1) {
+            snprintf(l2, sizeof l2, "Server: %s", sy_host);
+        }
+    }
+    sy_head = "Syncing";
+    sy_screen(head, l1, l2, l3, -1, "Press A to continue");
+    sy_wait_key();
+
+    if (sy_new > 0) {
+        pre_drawn = 0;
+        sy_reload_library();
+    }
 }
 
 // ------------------------------------------------------------ main
@@ -4648,6 +5397,8 @@ int main(int argc, char **argv)
         if (down & KEY_DOWN)             { view_first++; clamp_view(); listd = 1; }
         if (down & KEY_UP)               { view_first--; clamp_view(); listd = 1; }
         if ((down & KEY_START) && browse >= 0) { leave_album(); listd = 1; }
+        int do_sync = 0;
+        if ((down & KEY_START) && browse < 0) do_sync = 1;
 
         if (down & KEY_TOUCH) {
             touchPosition t;
@@ -4672,7 +5423,8 @@ int main(int argc, char **argv)
                     }
                 }
             } else if (ty < LIST_Y) {
-                if (tx < 60 && browse >= 0)        { leave_album(); listd = 1; }
+                if (browse < 0 && tx >= SYNC_X && tx < SYNC_X + SYNC_W) do_sync = 1;
+                else if (tx < 60 && browse >= 0)   { leave_album(); listd = 1; }
                 else if (tx >= 200 && tx < 224)    { view_first -= ROWS_VIS; clamp_view(); listd = 1; }
                 else if (tx >= 224)                { view_first += ROWS_VIS; clamp_view(); listd = 1; }
             } else if (ty >= PANEL_Y) {
@@ -4696,6 +5448,13 @@ int main(int argc, char **argv)
                     }
                 }
             }
+        }
+
+        if (do_sync) {
+            sy_run();
+            full = 1; recenter = 1;
+            now = now_ms();
+            t_prog = t_eq = t_viz = t_frame = now;
         }
 
         if (playing && track_ended) {
