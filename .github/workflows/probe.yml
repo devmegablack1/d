@@ -1,0 +1,55 @@
+name: Probe WiFi support
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/probe.yml'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm
+    steps:
+      - name: Look for WiFi support in the toolchain
+        shell: bash
+        run: |
+          {
+            echo "=== packages mentioning wifi ==="
+            dkp-pacman -Sy >/dev/null 2>&1 || true
+            dkp-pacman -Ss wifi 2>&1 | head -20
+            echo
+            echo "=== try installing nds-dev + dswifi ==="
+            dkp-pacman -S --noconfirm --needed nds-dev 2>&1 | tail -3 || true
+            for p in dswifi dswifi-nds nds-dswifi; do
+              dkp-pacman -S --noconfirm --needed $p 2>&1 | tail -2 && echo "(tried $p)"
+            done
+            echo
+            echo "=== installed wifi files ==="
+            find /opt/devkitpro -iname '*wifi*' 2>/dev/null | head -40
+            echo
+            echo "=== calico / libnds layout ==="
+            ls /opt/devkitpro/calico/bin /opt/devkitpro/calico/lib 2>&1 | head -60
+            ls /opt/devkitpro/libnds/lib 2>&1 | head -40
+            echo
+            echo "=== ARM7 cores: maxmod vs wifi symbols ==="
+            for f in /opt/devkitpro/calico/bin/ds7_*.elf /opt/devkitpro/libnds/default.elf; do
+              [ -f "$f" ] || continue
+              mm=$(arm-none-eabi-nm "$f" 2>/dev/null | grep -ci ' mm' || true)
+              wf=$(arm-none-eabi-nm "$f" 2>/dev/null | grep -ci 'wifi' || true)
+              echo "$f  maxmod=$mm  wifi=$wf"
+            done
+            echo
+            echo "=== wifi API in headers ==="
+            grep -rn "Wifi_InitDefault\|Wifi_ScanMode\|Wifi_ConnectOpenAP\|Wifi_ConnectAP\|Wifi_AssocStatus\|Wifi_GetNumAP" /opt/devkitpro/libnds/include /opt/devkitpro/calico/include 2>/dev/null | head -20
+            echo
+            echo "=== sockets ==="
+            ls /opt/devkitpro/libnds/include 2>/dev/null | head -60
+            echo
+            echo "=== versions ==="
+            dkp-pacman -Q 2>/dev/null | grep -i -E "libnds|calico|dswifi|maxmod|libfat"
+          } 2>&1 | tee probe-report.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: probe-report
+          path: probe-report.txt
