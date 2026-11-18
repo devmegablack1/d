@@ -4417,6 +4417,8 @@ static void draw_folder(int x, int y, u16 c)
     fill_rrect(fbB, x, y + 2, 17, 12, 2, c);
 }
 
+static int press_row = -1;                       // row under the finger (highlighted)
+
 static void draw_row(int idx)
 {
     int slot = idx - view_first;
@@ -4427,7 +4429,7 @@ static void draw_row(int idx)
     int sel = !folder && nfiles > 0 && browse == play_album && si == cur;
 
     fill_rect(fbB, 0, y, SW, ROW_H, C_BG);
-    if (sel) fill_rrect(fbB, 4, y + 1, 248, ROW_H - 2, 5, C_ROW);
+    if (sel || idx == press_row) fill_rrect(fbB, 4, y + 1, 248, ROW_H - 2, 5, C_ROW);
 
     char nm[NAME_LEN], shown[NAME_LEN + 4];
     (void)nm;
@@ -5667,6 +5669,147 @@ static void ol_run(void)
     }
 }
 
+// ------------------------------------------------------------ deleting songs / albums
+//
+// Hold a song or album in the library for a moment: a confirmation screen appears. Nothing is
+// removed unless you tap DELETE.
+
+#define C_RED RGB(224, 64, 64)
+
+static void del_pill(int x, int y, int w, const char *label, u16 bg, u16 fg)
+{
+    fill_rrect(fbB, x, y, w, 22, 11, bg);
+    int tw = text_width(&F_SB, label);
+    draw_text(fbB, &F_SB, x + (w - tw) / 2, y + 4, label, fg);
+}
+
+#define DEL_Y   128
+#define DEL1_X  16
+#define DEL2_X  136
+#define DEL_W   104
+
+static int del_dialog(const char *title, const char *name, const char *l1, const char *l2)
+{
+    char shown[NAME_LEN + 4];
+    fill_rect(fbB, 0, 0, SW, SH, C_BG);
+    draw_text(fbB, &F_LG, 16, 12, title, C_WHITE);
+    fit_text(shown, sizeof shown, &F_MD, name, 224);
+    draw_text(fbB, &F_MD, 16, 48, shown, C_WHITE);
+    draw_text(fbB, &F_SM, 16, 76, l1, C_GREY);
+    draw_text(fbB, &F_SM, 16, 90, l2, C_GREY);
+    draw_text(fbB, &F_SM, 16, 106, "This can't be undone.", C_RED);
+    del_pill(DEL1_X, DEL_Y, DEL_W, "DELETE", C_RED, C_WHITE);
+    del_pill(DEL2_X, DEL_Y, DEL_W, "CANCEL", C_ROW, C_GREY);
+    fill_rect(fbT, 0, 0, SW, SH, C_BG);
+    draw_text(fbT, &F_LG, 16, 70, "Delete?", C_WHITE);
+    draw_text(fbT, &F_SM, 16, 100, "Use the bottom screen to confirm.", C_DIM);
+    flush_screens();
+
+    int yes = -1;
+    while (yes < 0 && pmMainLoop()) {
+        swiWaitForVBlank();
+        scanKeys();
+        u32 d = keysDown();
+        if (d & KEY_B) yes = 0;
+        if (d & KEY_TOUCH) {
+            touchPosition t;
+            touchRead(&t);
+            if (t.py >= DEL_Y && t.py < DEL_Y + 22) {
+                if (t.px >= DEL1_X && t.px < DEL1_X + DEL_W) yes = 1;
+                else if (t.px >= DEL2_X && t.px < DEL2_X + DEL_W) yes = 0;
+            }
+        }
+    }
+    while (pmMainLoop() && (keysHeld() & (KEY_TOUCH | KEY_B))) {     // wait until the finger is lifted
+        swiWaitForVBlank();
+        scanKeys();
+    }
+    return yes == 1;
+}
+
+static void del_song_files(const char *dir, const char *file)
+{
+    static char p[NAME_LEN * 3], base[NAME_LEN], nm[NAME_LEN + 8];
+    join_path(p, sizeof p, dir, file);
+    song_cache_path(nm, sizeof nm, p);          // (this is a full path, reused below)
+    static char cache[NAME_LEN * 3];
+    snprintf(cache, sizeof cache, "%s", nm);
+    remove(p);
+    remove(cache);
+    snprintf(base, sizeof base, "%s", file);
+    size_t n = strlen(base);
+    if (n > 4) base[n - 4] = 0;
+    static const char *ext[] = { ".lrc", ".LRC", ".png", ".PNG" };
+    for (int i = 0; i < 4; i++) {
+        snprintf(nm, sizeof nm, "%s%s", base, ext[i]);
+        join_path(p, sizeof p, dir, nm);
+        remove(p);
+    }
+}
+
+static int del_is_ours(const char *n)               // files we may remove when an album is deleted
+{
+    size_t l = strlen(n);
+    if (l > 4 && (!strcasecmp(n + l - 4, ".mp3") || !strcasecmp(n + l - 4, ".lrc") ||
+                  !strcasecmp(n + l - 4, ".png") || !strcasecmp(n + l - 4, ".jpg"))) return 1;
+    if (l >= 9 && !strcasecmp(n + l - 9, ".koicover")) return 1;
+    if (!strcmp(n, ".koiindex")) return 1;
+    return 0;
+}
+
+static void del_album_files(const char *folder)
+{
+    static char dir[NAME_LEN * 2], p[NAME_LEN * 3];
+    join_path(dir, sizeof dir, dirpath, folder);
+    DIR *d = opendir(dir);
+    if (!d) return;
+    static char list[MAX_FILES + 64][NAME_LEN];
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && n < MAX_FILES + 64) {
+        if (!del_is_ours(e->d_name) || strlen(e->d_name) >= NAME_LEN) continue;
+        strcpy(list[n++], e->d_name);
+    }
+    closedir(d);
+    for (int i = 0; i < n; i++) { join_path(p, sizeof p, dir, list[i]); remove(p); }
+    rmdir(dir);                                      // fails (and is left alone) if other files remain
+}
+
+// idx = row in the library list that was held
+static void del_apply(int idx)
+{
+    static char dir[NAME_LEN * 2], file[NAME_LEN], label[NAME_LEN], keep[NAME_LEN];
+    int album = (browse < 0 && idx < nalb);
+    keep[0] = 0;
+    if (album) {
+        snprintf(file, sizeof file, "%s", albums[idx]);
+        album_label(label, sizeof label, albums[idx]);
+        if (!del_dialog("Delete album?", label, "Removes the folder and all its", "songs from the SD card.")) return;
+        close_track();
+        del_album_files(file);
+    } else {
+        int si = browse < 0 ? idx - nalb : idx;
+        const RowMeta *rm = row_meta(browse < 0, si);
+        if (browse < 0) { snprintf(dir, sizeof dir, "%s", dirpath); snprintf(file, sizeof file, "%s", rootf[si]); }
+        else { join_path(dir, sizeof dir, dirpath, albums[browse]); snprintf(file, sizeof file, "%s", bfiles[si]); snprintf(keep, sizeof keep, "%s", albums[browse]); }
+        snprintf(label, sizeof label, "%s", rm->title[0] ? rm->title : file);
+        if (!del_dialog("Delete song?", label, "Removes the file and its lyrics", "and picture from the SD card.")) return;
+        close_track();
+        del_song_files(dir, file);
+        if (browse >= 0 && scan_mp3s(dir, bfiles, MAX_FILES) == 0) {   // that was the last song: remove the empty album too
+            del_album_files(albums[browse]);
+            keep[0] = 0;
+        }
+    }
+    pre_drawn = 0;
+    sy_reload_library();
+    if (keep[0]) {                                   // go back into the album we were in
+        for (int i = 0; i < nalb; i++) {
+            if (!strcmp(albums[i], keep)) { enter_album(i); break; }
+        }
+    }
+}
+
 // ------------------------------------------------------------ main
 
 static void refresh_all(void)
@@ -5739,6 +5882,8 @@ int main(int argc, char **argv)
     unsigned now = now_ms(), t_prog = now, t_eq = now, t_viz = now, t_frame = now;
     unsigned viz_interval = 50;      // bars update 20 times a second (10 if the CPU is struggling)
     int frames = 0, slow = 0, combine = 0;
+    int lp_idx = -1, lp_fired = 0;           // finger on a list row: tap = open / play, hold = delete
+    unsigned lp_t0 = 0;
 
     while (pmMainLoop()) {
         mmStreamUpdate();
@@ -5789,19 +5934,9 @@ int main(int argc, char **argv)
             if (ty >= LIST_Y && ty < LIST_Y + ROWS_VIS * ROW_H) {
                 int idx = view_first + (ty - LIST_Y) / ROW_H;
                 if (idx >= 0 && idx < item_count()) {
-                    if (browse < 0 && idx < nalb) {
-                        enter_album(idx);                     // open the folder
-                        listd = 1;
-                    } else {
-                        int si = browse < 0 ? idx - nalb : idx;
-                        if (nfiles > 0 && browse == play_album && si == cur && playing) {
-                            paused = !paused;                 // tap the playing song
-                        } else {
-                            if (browse != play_album || nfiles == 0) use_browse_as_playlist();
-                            open_track(si);
-                        }
-                        full = 1;
-                    }
+                    lp_idx = idx; lp_t0 = now; lp_fired = 0;      // acts when the finger lifts, or on a long hold
+                    press_row = idx;
+                    draw_row(idx);
                 }
             } else if (ty < LIST_Y) {
                 if (browse < 0 && tx >= SYNC_X && tx < SYNC_X + SYNC_W) do_sync = 1;
@@ -5829,6 +5964,44 @@ int main(int argc, char **argv)
                     }
                 }
             }
+        }
+
+        int do_del = -1, tap_idx = -1;
+        if (lp_idx >= 0) {
+            if (keysHeld() & KEY_TOUCH) {
+                touchPosition t2;
+                touchRead(&t2);
+                int r2 = (t2.py >= LIST_Y && t2.py < LIST_Y + ROWS_VIS * ROW_H) ? view_first + (t2.py - LIST_Y) / ROW_H : -1;
+                if (r2 != lp_idx) { int o = lp_idx; lp_idx = -1; press_row = -1; draw_row(o); }   // slid away: cancel
+                else if (!lp_fired && now - lp_t0 >= 700) { lp_fired = 1; do_del = lp_idx; }
+            } else {
+                if (!lp_fired) tap_idx = lp_idx;
+                int o = lp_idx; lp_idx = -1; press_row = -1; draw_row(o);
+            }
+        }
+        if (tap_idx >= 0 && tap_idx < item_count()) {
+            int idx = tap_idx;
+            if (browse < 0 && idx < nalb) {
+                enter_album(idx);                             // open the folder
+                listd = 1;
+            } else {
+                int si = browse < 0 ? idx - nalb : idx;
+                if (nfiles > 0 && browse == play_album && si == cur && playing) {
+                    paused = !paused;                         // tap the playing song
+                } else {
+                    if (browse != play_album || nfiles == 0) use_browse_as_playlist();
+                    open_track(si);
+                }
+                full = 1;
+            }
+        }
+        if (do_del >= 0 && do_del < item_count()) {
+            int o = lp_idx; lp_idx = -1; press_row = -1; (void)o;
+            del_apply(do_del);
+            full = 1; recenter = 0;
+            clamp_view();
+            now = now_ms();
+            t_prog = t_eq = t_viz = t_frame = now;
         }
 
         if (do_sync) {
