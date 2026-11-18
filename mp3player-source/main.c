@@ -553,8 +553,12 @@ static void flush_screens(void)
 
 // geometry of the bottom screen
 #define LIST_Y      24
-#define SYNC_X      142
+#define SYNC_X      84
 #define SYNC_W      58
+#define EDIT_X      146
+#define EDIT_W      50
+#define DELB_X      196          // red DELETE button on a row in edit mode
+#define DELB_W      52
 #define ROW_H       24
 #define ROWS_VIS    5
 #define PANEL_Y     148
@@ -4418,6 +4422,14 @@ static void draw_folder(int x, int y, u16 c)
 }
 
 static int press_row = -1;                       // row under the finger (highlighted)
+static int edit_mode = 0;                        // EDIT on: every row shows a DELETE button
+
+static void draw_del_button(int y)
+{
+    fill_rrect(fbB, DELB_X, y + 3, DELB_W, ROW_H - 6, 9, RGB(224, 64, 64));
+    const char *l = "DELETE";
+    draw_text(fbB, &F_SB, DELB_X + (DELB_W - text_width(&F_SB, l)) / 2, y + 5, l, C_WHITE);
+}
 
 static void draw_row(int idx)
 {
@@ -4445,6 +4457,7 @@ static void draw_row(int idx)
         album_label(nm, sizeof nm, albums[idx]);
         fit_text(shown, sizeof shown, &F_MD, nm, 150);
         draw_text(fbB, &F_MD, 38, y + 4, shown, here ? C_GREEN : C_WHITE);
+        if (edit_mode) { draw_del_button(y); return; }
         char cnt[24];
         snprintf(cnt, sizeof cnt, albcount[idx] == 1 ? "%d song" : "%d songs", albcount[idx]);
         draw_text_right(fbB, &F_SM, 234, y + 6, cnt, C_DIM);
@@ -4464,8 +4477,10 @@ static void draw_row(int idx)
     int aw = rm->artist[0] ? text_width(&F_SM, rm->artist) : 0;
     if (aw > 80) aw = 80;
     int tmax = aw ? 206 - aw - 10 : 206;
+    if (edit_mode) { tmax = DELB_X - 44; aw = 0; }
     fit_text(shown, sizeof shown, &F_MD, rm->title, tmax);
     draw_text(fbB, &F_MD, 38, y + 4, shown, sel ? C_GREEN : C_WHITE);
+    if (edit_mode) draw_del_button(y);
     if (aw) {
         char ar[48];
         fit_text(ar, sizeof ar, &F_SM, rm->artist, aw);
@@ -4481,14 +4496,19 @@ static void draw_list(void)
     int n = item_count();
 
     if (browse < 0) {
-        draw_text(fbB, &F_LG, 10, 2, "Your Library", C_WHITE);
+        draw_text(fbB, &F_LG, 10, 2, "Library", C_WHITE);
         draw_pill(SYNC_X, 3, "ONLINE", SYNC_W, 0);
     } else {
         tri_left(fbB, 10, 6, 9, 13, C_WHITE);
         char nm[NAME_LEN], shown[NAME_LEN + 4];
         album_label(nm, sizeof nm, albums[browse]);
-        fit_text(shown, sizeof shown, &F_LG, nm, 165);
+        fit_text(shown, sizeof shown, &F_LG, nm, 112);
         draw_text(fbB, &F_LG, 26, 2, shown, C_WHITE);
+    }
+    {   // EDIT / DONE toggle: shows a red DELETE button on every row
+        const char *l = edit_mode ? "DONE" : "EDIT";
+        fill_rrect(fbB, EDIT_X, 3, EDIT_W, 18, 9, edit_mode ? RGB(224, 64, 64) : C_ROW);
+        draw_text(fbB, &F_SB, EDIT_X + (EDIT_W - text_width(&F_SB, l)) / 2, 5, l, edit_mode ? C_WHITE : C_GREY);
     }
 
     // scroll arrows
@@ -5924,6 +5944,7 @@ int main(int argc, char **argv)
         if (down & KEY_UP)               { view_first--; clamp_view(); listd = 1; }
         if ((down & KEY_START) && browse >= 0) { leave_album(); listd = 1; }
         int do_sync = 0;
+        int do_del = -1, tap_idx = -1;
         if ((down & KEY_START) && browse < 0) do_sync = 1;
 
         if (down & KEY_TOUCH) {
@@ -5934,12 +5955,17 @@ int main(int argc, char **argv)
             if (ty >= LIST_Y && ty < LIST_Y + ROWS_VIS * ROW_H) {
                 int idx = view_first + (ty - LIST_Y) / ROW_H;
                 if (idx >= 0 && idx < item_count()) {
-                    lp_idx = idx; lp_t0 = now; lp_fired = 0;      // acts when the finger lifts, or on a long hold
-                    press_row = idx;
-                    draw_row(idx);
+                    if (edit_mode && tx >= DELB_X) {
+                        do_del = idx;                                 // the red DELETE button
+                    } else {
+                        lp_idx = idx; lp_t0 = now; lp_fired = 0;      // acts when the finger lifts, or on a long hold
+                        press_row = idx;
+                        draw_row(idx);
+                    }
                 }
             } else if (ty < LIST_Y) {
                 if (browse < 0 && tx >= SYNC_X && tx < SYNC_X + SYNC_W) do_sync = 1;
+                else if (tx >= EDIT_X && tx < EDIT_X + EDIT_W) { edit_mode = !edit_mode; listd = 1; }
                 else if (tx < 60 && browse >= 0)   { leave_album(); listd = 1; }
                 else if (tx >= 200 && tx < 224)    { view_first -= ROWS_VIS; clamp_view(); listd = 1; }
                 else if (tx >= 224)                { view_first += ROWS_VIS; clamp_view(); listd = 1; }
@@ -5966,7 +5992,6 @@ int main(int argc, char **argv)
             }
         }
 
-        int do_del = -1, tap_idx = -1;
         if (lp_idx >= 0) {
             if (keysHeld() & KEY_TOUCH) {
                 touchPosition t2;
