@@ -10,41 +10,46 @@ jobs:
     runs-on: ubuntu-latest
     container: devkitpro/devkitarm
     steps:
-      - name: Look at the WiFi API and ARM7 cores
+      - name: Look at the ARM7 cores, WLAN API and examples
         shell: bash
         run: |
+          set +e
           {
-            echo "=================== dswifi9.h ==================="
-            cat /opt/devkitpro/libnds/include/dswifi9.h
-            echo
-            echo "=================== wfc.h ======================="
-            cat /opt/devkitpro/libnds/include/wfc.h
-            echo
-            echo "=================== other net headers ==========="
-            ls /opt/devkitpro/libnds/include/sys /opt/devkitpro/libnds/include/netinet /opt/devkitpro/libnds/include/arpa 2>&1 | head -40
-            echo
-            echo "=================== ARM7 core files ============="
-            ls -l /opt/devkitpro/calico/bin/
+            echo "=================== ARM7 cores: which features are inside ==="
             for f in /opt/devkitpro/calico/bin/ds7_*.elf; do
-              echo "--- $f"
-              arm-none-eabi-strings -a "$f" | grep -i -E 'wifi|wfc|ntrwifi|twlwifi|maxmod|mmStream|soundCmd|wlan' | head -8
+              echo "--- $f ($(stat -c %s "$f") bytes)"
+              for w in wfc ntrwifi twlwifi wlan maxmod mmStream mmInit sound touch rtc pm; do
+                printf '%s=%s  ' "$w" "$(grep -a -o -i "$w" "$f" | wc -l)"
+              done
+              echo
             done
             echo
-            echo "=================== calico notes about the cores ="
-            grep -rIn -i -E 'maine|ragdoll|sphynx|lykoi|bobtail' /opt/devkitpro/calico /opt/devkitpro/libnds /opt/devkitpro/devkitARM/base_tools /opt/devkitpro/*.mk 2>/dev/null | grep -v '\.elf' | head -40
-            find /opt/devkitpro -maxdepth 3 \( -name 'ds_rules' -o -name '*.mk' -o -name 'README*' -o -name '*.md' \) 2>/dev/null | head -30
+            echo "=================== calico notes about the cores ==="
+            grep -rIn -i -E 'maine|ragdoll|sphynx|lykoi|bobtail' /opt/devkitpro/calico /opt/devkitpro/libnds /opt/devkitpro/devkitARM/base_tools /opt/devkitpro/*.mk /opt/devkitpro/examples/nds/dswifi 2>/dev/null | grep -v '\.elf' | head -40
             echo
-            echo "=================== dswifi examples ============="
+            echo "=================== wlan types (WlanBssDesc, WlanAuthData, scan) ==="
+            grep -rl "WlanAuthData" /opt/devkitpro/calico/include /opt/devkitpro/libnds/include 2>/dev/null
+            for h in $(grep -rl "WlanAuthData" /opt/devkitpro/calico/include 2>/dev/null | head -3); do echo "##### $h"; cat "$h"; done | head -400
+            echo
+            echo "=================== dswifi examples ==="
             ls -R /opt/devkitpro/examples/nds/dswifi | head -60
             for d in /opt/devkitpro/examples/nds/dswifi/*/; do
-              echo "--- Makefile of $d (arm7 / lib lines)"
-              grep -n -i -E 'arm7|ARM7|LIBS|ds7|NDSTOOL|-7' "$d/Makefile" | head -15
-              ls "$d/arm7" 2>/dev/null
+              echo "--- Makefile of $d"
+              grep -n -i -E 'arm7|ds7|ndstool|NDSTOOL|LIBS|dsi|twl|header|-z|-g ' "$d/Makefile" | head -25
             done
             echo
-            echo "=================== an example's source ========="
-            for f in /opt/devkitpro/examples/nds/dswifi/*/source/*.c; do echo "##### $f"; head -120 "$f"; done 2>/dev/null | head -400
+            echo "=================== example sources ==="
+            for f in /opt/devkitpro/examples/nds/dswifi/*/source/*.c; do echo "##### $f"; head -150 "$f"; done 2>/dev/null | head -500
+            echo
+            echo "=================== how DSi mode is built (ndstool / rules) ==="
+            ndstool 2>&1 | grep -i -E 'dsi|twl|-g|-z|-u |-9i|-7i|region' | head -20
+            find /opt/devkitpro -maxdepth 4 \( -name 'ds_rules' -o -name 'base_rules' -o -name '*.mk' \) 2>/dev/null | head
+            grep -rn -i -E 'dsi|twl|-g |-z ' /opt/devkitpro/calico/share 2>/dev/null | head -20
+            echo
+            echo "=================== versions ==="
+            dkp-pacman -Q 2>/dev/null | grep -i -E "libnds|calico|dswifi|maxmod|libfat|ndstool"
           } 2>&1 | tee probe-report.txt
+          exit 0
 
       - uses: actions/upload-artifact@v4
         with:
