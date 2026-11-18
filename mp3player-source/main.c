@@ -4480,7 +4480,7 @@ static void draw_list(void)
 
     if (browse < 0) {
         draw_text(fbB, &F_LG, 10, 2, "Your Library", C_WHITE);
-        draw_pill(SYNC_X, 3, "SYNC", SYNC_W, 0);
+        draw_pill(SYNC_X, 3, "ONLINE", SYNC_W, 0);
     } else {
         tri_left(fbB, 10, 6, 9, 13, C_WHITE);
         char nm[NAME_LEN], shown[NAME_LEN + 4];
@@ -4497,7 +4497,7 @@ static void draw_list(void)
         if (browse < 0) {
             draw_text(fbB, &F_MD, 10, 50, "Nothing here yet.", C_GREY);
             draw_text(fbB, &F_SM, 10, 68, "Copy .mp3 files or folders next to this app.", C_DIM);
-            draw_text(fbB, &F_SM, 10, 84, "Or tap SYNC to download from your server.", C_DIM);
+            draw_text(fbB, &F_SM, 10, 84, "Or tap ONLINE to get music from your server.", C_DIM);
         } else {
             draw_text(fbB, &F_MD, 10, 50, "No songs in this album.", C_GREY);
         }
@@ -4571,6 +4571,7 @@ static unsigned sy_t0 = 0, sy_t_ui = 0;
 static char   sy_cur_name[NAME_LEN] = "";
 static const char *sy_head = "Syncing";
 static char   sy_buf[16384] __attribute__((aligned(4)));
+static int    sy_keep_bottom = 0;        // 1 = leave the bottom screen (the list) alone
 
 static void sy_fmt(char *dst, size_t cap, unsigned long long b)
 {
@@ -4581,7 +4582,7 @@ static void sy_fmt(char *dst, size_t cap, unsigned long long b)
 static void sy_screen(const char *head, const char *a, const char *b, const char *c, int permille, const char *foot)
 {
     fill_rect(fbT, 0, 0, SW, SH, C_BG);
-    fill_rect(fbB, 0, 0, SW, SH, C_BG);
+    if (!sy_keep_bottom) fill_rect(fbB, 0, 0, SW, SH, C_BG);
     char t[NAME_LEN + 8];
     draw_text(fbT, &F_LG, 16, 20, head, C_WHITE);
     if (a && a[0]) { fit_text(t, sizeof t, &F_MD, a, 224); draw_text(fbT, &F_MD, 16, 62, t, C_WHITE); }
@@ -4595,8 +4596,10 @@ static void sy_screen(const char *head, const char *a, const char *b, const char
     }
     if (foot && foot[0]) draw_text(fbT, &F_SM, 16, 156, foot, C_DIM);
     draw_text_right(fbT, &F_SB, 240, 178, "made by koi", C_GREEN);
-    draw_text(fbB, &F_MD, 16, 80, "Online sync", C_GREY);
-    draw_text(fbB, &F_SM, 16, 100, "Hold B to cancel.", C_DIM);
+    if (!sy_keep_bottom) {
+        draw_text(fbB, &F_MD, 16, 80, "Online sync", C_GREY);
+        draw_text(fbB, &F_SM, 16, 100, "Hold B to cancel.", C_DIM);
+    }
     flush_screens();
 }
 
@@ -5047,10 +5050,13 @@ static int jr_skip(Jr *j, int t)
     return 1;
 }
 
+static void ol_add(const char *folder, int root, const char *upath, long size, const char *save_as);
+
 // One song / cover. Returns 0 to stop everything (cancelled / too many failures).
 static int sy_entry(const char *folder, int root, const char *upath, long size, const char *save_as)
 {
     sy_idx++;
+    if (sy_mode == 2) { ol_add(folder, root, upath, size, save_as); return 1; }
     if (sy_mode == 0) { sy_total++; return 1; }
 
     static char name[NAME_LEN], un[NAME_LEN];       // static: the DS stack is small
@@ -5220,67 +5226,442 @@ static int sy_wifi(void)
     return 1;
 }
 
-static void sy_run(void)
+// ------------------------------------------------------------ online library browser
+//
+// START / the ONLINE button opens the list of albums on your server. Tap an album to see its
+// tracks, tap a track to download just that one, or use GET ALBUM / GET ALL for the rest.
+// Things that are already on the SD card get a green tick.
+
+#define MAX_OF 1500
+#define MAX_OA 160
+#define OL_POOL (128 * 1024)
+
+typedef struct { unsigned po, no; long size; unsigned short album; unsigned char have; } OFile;
+typedef struct { unsigned fo, cover; unsigned short first, n, have_n; unsigned char root, cover_tried; } OAlb;
+
+static OFile    ofile[MAX_OF];
+static OAlb     oalb[MAX_OA];
+static char     opool[OL_POOL];
+static unsigned opool_n = 1;                  // offset 0 = "none"
+static int      nof = 0, noa = 0, ol_trunc = 0;
+static char     ol_last_folder[NAME_LEN];
+static int      ol_last_root = -1;
+
+static int ol_view = 0, ol_alb = 0, ol_first = 0, ol_sel = 0;
+static int ol_downloaded = 0;                 // files added during this visit
+static char ol_status[120];
+
+static unsigned ol_pool(const char *s)
 {
-    if (playing) close_track();                    // the radio and the decoder do not share the CPU well
+    size_t n = strlen(s) + 1;
+    if (opool_n + n > OL_POOL) { ol_trunc = 1; return 0; }
+    unsigned o = opool_n;
+    memcpy(opool + o, s, n);
+    opool_n += (unsigned)n;
+    return o;
+}
+
+static void ol_dest(int i, char *dir, size_t dcap, char *dest, size_t pcap)
+{
+    const OAlb *a = &oalb[ofile[i].album];
+    if (a->root || !opool[a->fo]) snprintf(dir, dcap, "%s", dirpath);
+    else join_path(dir, dcap, dirpath, opool + a->fo);
+    join_path(dest, pcap, dir, opool + ofile[i].no);
+}
+
+static int ol_have_file(int i)
+{
+    static char dir[NAME_LEN * 2], dest[NAME_LEN * 3];
+    ol_dest(i, dir, sizeof dir, dest, sizeof dest);
+    struct stat st;
+    return stat(dest, &st) == 0 && S_ISREG(st.st_mode) && (ofile[i].size <= 0 || (long)st.st_size == ofile[i].size);
+}
+
+static void ol_recount(void)
+{
+    for (int a = 0; a < noa; a++) {
+        int h = 0;
+        for (int k = 0; k < oalb[a].n; k++) h += ofile[oalb[a].first + k].have;
+        oalb[a].have_n = (unsigned short)h;
+    }
+}
+
+// called by the albums.json reader while collecting
+static void ol_add(const char *folder, int root, const char *upath, long size, const char *save_as)
+{
+    if (noa == 0 || ol_last_root != root || strcmp(ol_last_folder, folder) != 0) {
+        if (noa >= MAX_OA) { ol_trunc = 1; return; }
+        OAlb *a = &oalb[noa++];
+        memset(a, 0, sizeof *a);
+        a->fo = ol_pool(folder);
+        a->first = (unsigned short)nof;
+        a->root = (unsigned char)root;
+        snprintf(ol_last_folder, sizeof ol_last_folder, "%s", folder);
+        ol_last_root = root;
+    }
+    OAlb *a = &oalb[noa - 1];
+    if (save_as && !strcmp(save_as, "icon.png")) { a->cover = ol_pool(upath); return; }
+    if (nof >= MAX_OF) { ol_trunc = 1; return; }
+    static char name[NAME_LEN], un[NAME_LEN];
+    if (save_as && save_as[0]) sy_safe(name, sizeof name, save_as);
+    else {
+        const char *b = strrchr(upath, '/');
+        b = b ? b + 1 : upath;
+        sy_unescape(un, sizeof un, b);
+        sy_safe(name, sizeof name, un);
+    }
+    OFile *o = &ofile[nof];
+    o->po = ol_pool(upath);
+    o->no = ol_pool(name);
+    if (!o->po || !o->no) return;
+    o->size = size;
+    o->album = (unsigned short)(noa - 1);
+    o->have = 0;
+    a->n++;
+    nof++;
+}
+
+// ---- drawing
+
+static void ol_title(char *dst, size_t cap, int a)
+{
+    if (oalb[a].root || !opool[oalb[a].fo]) { snprintf(dst, cap, "Loose songs"); return; }
+    snprintf(dst, cap, "%s", opool + oalb[a].fo);
+    for (char *p = dst; *p; p++) if (*p == '_') *p = ' ';
+}
+
+static void ol_trackname(char *dst, size_t cap, int i)
+{
+    snprintf(dst, cap, "%s", opool + ofile[i].no);
+    size_t n = strlen(dst);
+    if (n > 4 && !strcasecmp(dst + n - 4, ".mp3")) dst[n - 4] = 0;
+}
+
+static int ol_count(void) { return ol_view == 0 ? noa : oalb[ol_alb].n; }
+
+static void ol_clamp(void)
+{
+    int n = ol_count();
+    if (ol_sel >= n) ol_sel = n - 1;
+    if (ol_sel < 0) ol_sel = 0;
+    if (ol_sel < ol_first) ol_first = ol_sel;
+    if (ol_sel >= ol_first + ROWS_VIS) ol_first = ol_sel - ROWS_VIS + 1;
+    int maxf = n - ROWS_VIS;
+    if (maxf < 0) maxf = 0;
+    if (ol_first > maxf) ol_first = maxf;
+    if (ol_first < 0) ol_first = 0;
+}
+
+static void ol_tick(int x, int y, u16 c)             // a small check mark, 9 wide
+{
+    for (int t = 0; t < 2; t++) {
+        putpx(fbB, x + 0, y + 4 + t, c); putpx(fbB, x + 1, y + 5 + t, c); putpx(fbB, x + 2, y + 6 + t, c);
+        putpx(fbB, x + 3, y + 5 + t, c); putpx(fbB, x + 4, y + 4 + t, c); putpx(fbB, x + 5, y + 3 + t, c);
+        putpx(fbB, x + 6, y + 2 + t, c); putpx(fbB, x + 7, y + 1 + t, c); putpx(fbB, x + 8, y + 0 + t, c);
+    }
+}
+
+static void ol_row(int idx)
+{
+    int slot = idx - ol_first;
+    if (slot < 0 || slot >= ROWS_VIS || idx >= ol_count()) return;
+    int y = LIST_Y + slot * ROW_H;
+    fill_rect(fbB, 0, y, SW, ROW_H, C_BG);
+    if (idx == ol_sel) fill_rrect(fbB, 4, y + 1, 248, ROW_H - 2, 5, C_ROW);
+    char nm[NAME_LEN], shown[NAME_LEN + 4], r[32];
+    if (ol_view == 0) {
+        int all = oalb[idx].n > 0 && oalb[idx].have_n == oalb[idx].n;
+        draw_folder(11, y + 5, all ? C_GREEN : C_GREY);
+        ol_title(nm, sizeof nm, idx);
+        fit_text(shown, sizeof shown, &F_MD, nm, 150);
+        draw_text(fbB, &F_MD, 38, y + 4, shown, all ? C_GREEN : C_WHITE);
+        snprintf(r, sizeof r, "%d/%d", oalb[idx].have_n, oalb[idx].n);
+        draw_text_right(fbB, &F_SM, 234, y + 6, r, all ? C_GREEN : C_DIM);
+        tri_right(fbB, 240, y + 8, 5, 9, C_DIM);
+    } else {
+        int fi = oalb[ol_alb].first + idx;
+        if (ofile[fi].have) ol_tick(12, y + 7, C_GREEN);
+        else tri_down(fbB, 11, y + 8, 11, 8, C_GREY);
+        ol_trackname(nm, sizeof nm, fi);
+        fit_text(shown, sizeof shown, &F_MD, nm, 170);
+        draw_text(fbB, &F_MD, 30, y + 4, shown, ofile[fi].have ? C_GREEN : C_WHITE);
+        if (ofile[fi].size > 0) sy_fmt(r, sizeof r, (unsigned long long)ofile[fi].size);
+        else r[0] = 0;
+        draw_text_right(fbB, &F_SM, 246, y + 6, r, C_DIM);
+    }
+}
+
+#define OL_P1_X 8
+#define OL_P1_W 118
+#define OL_P2_X 134
+#define OL_P2_W 114
+#define OL_PY   (PANEL_Y + 5)
+
+static void ol_bottom(void)
+{
+    fill_rect(fbB, 0, 0, SW, PANEL_Y, C_BG);
+    char nm[NAME_LEN], shown[NAME_LEN + 4];
+    if (ol_view == 0) {
+        draw_text(fbB, &F_LG, 10, 2, "Online", C_WHITE);
+    } else {
+        tri_left(fbB, 10, 6, 9, 13, C_WHITE);
+        ol_title(nm, sizeof nm, ol_alb);
+        fit_text(shown, sizeof shown, &F_LG, nm, 165);
+        draw_text(fbB, &F_LG, 26, 2, shown, C_WHITE);
+    }
+    int n = ol_count();
+    tri_up(fbB, 210, 8, 12, 7, n > ROWS_VIS && ol_first > 0 ? C_WHITE : C_TRACK);
+    tri_down(fbB, 234, 8, 12, 7, n > ROWS_VIS && ol_first < n - ROWS_VIS ? C_WHITE : C_TRACK);
+    if (n == 0) draw_text(fbB, &F_MD, 10, 50, "Nothing on the server yet.", C_GREY);
+    for (int i = 0; i < ROWS_VIS; i++) if (ol_first + i < n) ol_row(ol_first + i);
+
+    fill_rect(fbB, 0, PANEL_Y, SW, SH - PANEL_Y, C_PANEL);
+    fill_rect(fbB, 0, PANEL_Y, SW, 1, C_LINE);
+    draw_pill(OL_P1_X, OL_PY, ol_view == 0 ? "GET EVERYTHING" : "GET ALBUM", OL_P1_W, 1);
+    draw_pill(OL_P2_X, OL_PY, ol_view == 0 ? "EXIT" : "BACK", OL_P2_W, 0);
+    fit_text(shown, sizeof shown, &F_SM, ol_status, 240);
+    draw_text(fbB, &F_SM, 8, PANEL_Y + 27, shown, C_GREY);
+}
+
+static void ol_top(void)
+{
+    fill_rect(fbT, 0, 0, SW, SH, C_BG);
+    char t[NAME_LEN + 24], nm[NAME_LEN];
+    int have = 0;
+    for (int i = 0; i < nof; i++) have += ofile[i].have;
+    if (ol_view == 0) {
+        draw_text(fbT, &F_LG, 16, 20, "Online library", C_WHITE);
+        draw_text(fbT, &F_SM, 16, 56, sy_host, C_GREY);
+        snprintf(t, sizeof t, "%d albums,  %d tracks", noa, nof);
+        draw_text(fbT, &F_MD, 16, 80, t, C_WHITE);
+        snprintf(t, sizeof t, "%d already on your card", have);
+        draw_text(fbT, &F_SM, 16, 102, t, C_GREEN);
+        if (ol_trunc) draw_text(fbT, &F_SM, 16, 118, "List was too long, some is not shown.", C_DIM);
+    } else {
+        ol_title(nm, sizeof nm, ol_alb);
+        fit_text(t, sizeof t, &F_LG, nm, 224);
+        draw_text(fbT, &F_LG, 16, 20, t, C_WHITE);
+        snprintf(t, sizeof t, "%d tracks", oalb[ol_alb].n);
+        draw_text(fbT, &F_MD, 16, 62, t, C_WHITE);
+        snprintf(t, sizeof t, "%d already on your card", oalb[ol_alb].have_n);
+        draw_text(fbT, &F_SM, 16, 84, t, C_GREEN);
+        unsigned long long left = 0;
+        for (int k = 0; k < oalb[ol_alb].n; k++) {
+            const OFile *o = &ofile[oalb[ol_alb].first + k];
+            if (!o->have && o->size > 0) left += (unsigned long long)o->size;
+        }
+        if (left) {
+            char sz[16];
+            sy_fmt(sz, sizeof sz, left);
+            snprintf(t, sizeof t, "%s still to download", sz);
+            draw_text(fbT, &F_SM, 16, 100, t, C_GREY);
+        }
+    }
+    draw_text(fbT, &F_SM, 16, 150, "Tap to open / download   A = select", C_DIM);
+    draw_text(fbT, &F_SM, 16, 163, "X = get all   B = back", C_DIM);
+    draw_text_right(fbT, &F_SB, 240, 178, "made by koi", C_GREEN);
+}
+
+static void ol_redraw(void)
+{
+    ol_clamp();
+    ol_top();
+    ol_bottom();
+    flush_screens();
+}
+
+// ---- downloading
+
+static int ol_cover(int a)                           // fetch icon.png once, if the album has one
+{
+    OAlb *al = &oalb[a];
+    if (!al->cover || al->cover_tried) return 1;
+    al->cover_tried = 1;
+    static char dir[NAME_LEN * 2], dest[NAME_LEN * 3];
+    if (al->root || !opool[al->fo]) snprintf(dir, sizeof dir, "%s", dirpath);
+    else join_path(dir, sizeof dir, dirpath, opool + al->fo);
+    join_path(dest, sizeof dest, dir, "icon.png");
+    struct stat st;
+    if (stat(dest, &st) == 0) return 1;
+    if (stat(dir, &st) != 0) mkdir(dir, 0777);
+    snprintf(sy_cur_name, sizeof sy_cur_name, "cover");
+    sy_cur_bytes = 0; sy_cur_total = 0;
+    return sy_get(opool + al->cover, dest, 0);
+}
+
+static int ol_get_one(int i)
+{
+    static char dir[NAME_LEN * 2], dest[NAME_LEN * 3];
+    ol_dest(i, dir, sizeof dir, dest, sizeof dest);
+    struct stat st;
+    if (stat(dir, &st) != 0) mkdir(dir, 0777);
+    ol_cover(ofile[i].album);
+    snprintf(sy_cur_name, sizeof sy_cur_name, "%s", opool + ofile[i].no);
+    sy_cur_bytes = 0;
+    sy_cur_total = ofile[i].size;
+    sy_ui(1);
+    if (!sy_get(opool + ofile[i].po, dest, ofile[i].size)) return 0;
+    ofile[i].have = 1;
+    oalb[ofile[i].album].have_n++;
+    ol_downloaded++;
+    return 1;
+}
+
+// first..first+n-1 are file indexes; downloads every one that is missing
+static void ol_get_range(int first, int n)
+{
+    int missing = 0;
+    for (int i = first; i < first + n; i++) if (!ofile[i].have) missing++;
+    if (missing == 0) { snprintf(ol_status, sizeof ol_status, "Everything here is already on your card"); return; }
+
+    sy_keep_bottom = 1;
+    sy_head = "Downloading";
+    sy_total = missing; sy_idx = 0; sy_new = 0; sy_skip = 0; sy_fail = 0; sy_streak = 0;
+    sy_bytes_all = 0; sy_t0 = now_ms();
+    sy_msg[0] = 0; sy_cancelled = 0;
+    for (int i = first; i < first + n; i++) {
+        if (ofile[i].have) continue;
+        sy_idx++;
+        if (ol_get_one(i)) { sy_new++; sy_streak = 0; ol_bottom(); flush_screens(); }
+        else {
+            if (sy_cancelled) break;
+            sy_fail++;
+            if (++sy_streak >= 3) break;
+        }
+    }
+    sy_keep_bottom = 0;
+    sy_head = "Syncing";
+    if (sy_cancelled) snprintf(ol_status, sizeof ol_status, "Stopped. %d downloaded", sy_new);
+    else if (sy_fail) snprintf(ol_status, sizeof ol_status, "%d ok, %d failed: %s", sy_new, sy_fail, sy_msg[0] ? sy_msg : "try again");
+    else snprintf(ol_status, sizeof ol_status, "Done: %d downloaded", sy_new);
+}
+
+static void ol_get_all_albums(void)
+{
+    // one pass over everything that is missing, album by album (files are stored in album order)
+    ol_get_range(0, nof);
+}
+
+// ---- the screen
+
+static void ol_act(int idx)
+{
+    if (idx < 0 || idx >= ol_count()) return;
+    if (ol_view == 0) {
+        ol_view = 1; ol_alb = idx; ol_sel = 0; ol_first = 0;
+        ol_status[0] = 0;
+    } else {
+        int fi = oalb[ol_alb].first + idx;
+        if (ofile[fi].have) { snprintf(ol_status, sizeof ol_status, "Already on your card"); return; }
+        ol_get_range(fi, 1);
+    }
+}
+
+static void ol_get_scope(void)
+{
+    if (ol_view == 0) ol_get_all_albums();
+    else ol_get_range(oalb[ol_alb].first, oalb[ol_alb].n);
+}
+
+static int ol_back(void)                              // 1 = leave the online screen
+{
+    if (ol_view == 1) {
+        ol_view = 0;
+        ol_sel = ol_alb; ol_first = 0;
+        ol_status[0] = 0;
+        return 0;
+    }
+    return 1;
+}
+
+static void ol_run(void)
+{
+    if (playing) close_track();                       // the radio and the decoder do not share the CPU well
     sy_load_cfg();
     sy_msg[0] = 0; sy_cancelled = 0;
+    sy_keep_bottom = 0;
+    nof = noa = ol_trunc = 0;
+    opool_n = 1;
+    ol_last_root = -1; ol_last_folder[0] = 0;
+    ol_view = 0; ol_alb = 0; ol_first = 0; ol_sel = 0; ol_downloaded = 0; ol_status[0] = 0;
     sy_total = sy_idx = sy_new = sy_skip = sy_fail = sy_streak = 0;
     sy_bytes_all = 0; sy_cur_bytes = sy_cur_total = 0; sy_cur_name[0] = 0;
     sy_t0 = now_ms();
 
-    int stage = 0;                                 // 0 wifi, 1 list, 2 files, 3 finished
-    int result = 0;                                // 1 ok, 0 problem
     static char jp[NAME_LEN * 3];
     join_path(jp, sizeof jp, dirpath, ".koi_albums.json");
 
-    if (sy_wifi()) {
-        stage = 1;
+    const char *why1 = NULL, *why2 = NULL;
+    int ok = 0;
+    if (!sy_wifi()) {
+        why1 = "Save a WiFi connection in the DSi";
+        why2 = "settings first (open, WEP or WPA2).";
+    } else {
         sy_screen("Getting the list", sy_host, "albums.json", "", -1, "Hold B to cancel");
-        sy_mode = 1;
-        sy_cur_name[0] = 0;
         if (sy_get("albums.json", jp, 0)) {
-            stage = 2;
-            sy_mode = 0; sy_idx = 0; sy_total = 0;
-            int r = sy_walk(jp);                   // pass 1: count
-            if (r < 0) { snprintf(sy_msg, sizeof sy_msg, "albums.json is not valid"); }
-            else {
-                sy_mode = 1; sy_idx = 0; sy_t0 = now_ms();
-                sy_head = "Downloading";
-                sy_walk(jp);                       // pass 2: download what is missing
-                stage = 3;
-                result = (sy_fail == 0 && !sy_cancelled);
-            }
+            sy_mode = 2;
+            int r = sy_walk(jp);
+            sy_mode = 1;
+            if (r < 0) snprintf(sy_msg, sizeof sy_msg, "albums.json is not valid");
+            else if (nof == 0) snprintf(sy_msg, sizeof sy_msg, "The server list is empty");
+            else ok = 1;
+        } else {
+            why1 = sy_host;
         }
     }
     remove(jp);
-    Wifi_DisconnectAP();
 
-    char l1[96], l2[96], l3[96];
-    l1[0] = l2[0] = l3[0] = 0;
-    const char *head = "Sync finished";
-    if (stage == 3 && result) {
-        snprintf(l1, sizeof l1, "%d new, %d already up to date", sy_new, sy_skip);
-        if (sy_new == 0) snprintf(l2, sizeof l2, "Everything is already on this card.");
-    } else if (stage == 3) {
-        head = sy_cancelled ? "Sync stopped" : "Sync finished with problems";
-        snprintf(l1, sizeof l1, "%d new, %d up to date, %d failed", sy_new, sy_skip, sy_fail);
-        snprintf(l2, sizeof l2, "%s", sy_msg[0] ? sy_msg : "Run sync again to retry.");
-    } else {
-        head = "Couldn't sync";
+    if (!ok) {
+        Wifi_DisconnectAP();
+        char l1[120], l2[120];
         snprintf(l1, sizeof l1, "%s", sy_msg[0] ? sy_msg : "Something went wrong");
-        if (stage == 0) {
-            snprintf(l2, sizeof l2, "Save a WiFi connection in the DSi");
-            snprintf(l3, sizeof l3, "settings first (open, WEP or WPA2).");
-        } else if (stage == 1) {
-            snprintf(l2, sizeof l2, "Server: %s", sy_host);
-        }
+        snprintf(l2, sizeof l2, "%s", why1 ? why1 : "");
+        sy_screen("Couldn't connect", l1, l2, why2 ? why2 : "", -1, "Press A to go back");
+        sy_wait_key();
+        return;
     }
-    sy_head = "Syncing";
-    sy_screen(head, l1, l2, l3, -1, "Press A to continue");
-    sy_wait_key();
 
-    if (sy_new > 0) {
+    for (int i = 0; i < nof; i++) ofile[i].have = (unsigned char)ol_have_file(i);
+    ol_recount();
+    ol_redraw();
+
+    int leave = 0;
+    while (!leave && pmMainLoop()) {
+        swiWaitForVBlank();
+        scanKeys();
+        u32 down = keysDown();
+        int dirty = 0;
+
+        if (down & KEY_UP)    { ol_sel--; dirty = 1; }
+        if (down & KEY_DOWN)  { ol_sel++; dirty = 1; }
+        if (down & KEY_L)     { ol_sel -= ROWS_VIS; dirty = 1; }
+        if (down & KEY_R)     { ol_sel += ROWS_VIS; dirty = 1; }
+        if (down & KEY_A)     { ol_act(ol_sel); dirty = 1; }
+        if (down & KEY_X)     { ol_get_scope(); dirty = 1; }
+        if (down & (KEY_B | KEY_START | KEY_SELECT)) { if (ol_back()) leave = 1; dirty = 1; }
+
+        if (down & KEY_TOUCH) {
+            touchPosition t;
+            touchRead(&t);
+            int tx = t.px, ty = t.py;
+            if (ty >= LIST_Y && ty < LIST_Y + ROWS_VIS * ROW_H) {
+                int idx = ol_first + (ty - LIST_Y) / ROW_H;
+                if (idx < ol_count()) { ol_sel = idx; ol_act(idx); dirty = 1; }
+            } else if (ty < LIST_Y) {
+                if (tx < 60 && ol_view == 1)     { ol_back(); dirty = 1; }
+                else if (tx >= 200 && tx < 224)  { ol_sel -= ROWS_VIS; dirty = 1; }
+                else if (tx >= 224)              { ol_sel += ROWS_VIS; dirty = 1; }
+            } else if (ty >= OL_PY && ty < OL_PY + 20) {
+                if (tx >= OL_P1_X && tx < OL_P1_X + OL_P1_W) { ol_get_scope(); dirty = 1; }
+                else if (tx >= OL_P2_X && tx < OL_P2_X + OL_P2_W) { if (ol_back()) leave = 1; dirty = 1; }
+            }
+        }
+        if (dirty && !leave) ol_redraw();
+    }
+
+    Wifi_DisconnectAP();
+    if (ol_downloaded > 0) {
+        sy_screen("Updating your library", "Reading the new songs...", "", "", -1, "");
         pre_drawn = 0;
         sy_reload_library();
     }
@@ -5451,7 +5832,7 @@ int main(int argc, char **argv)
         }
 
         if (do_sync) {
-            sy_run();
+            ol_run();
             full = 1; recenter = 1;
             now = now_ms();
             t_prog = t_eq = t_viz = t_frame = now;
