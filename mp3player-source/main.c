@@ -2772,13 +2772,13 @@ static void cover_load_dir(const char *dir)
 }
 
 // shrink the loaded cover to a THUMB x THUMB picture
-static void make_thumb(u16 *dst)
+static void make_thumb_n(u16 *dst, int T)
 {
-    int b = cover_s / THUMB;
-    for (int j = 0; j < THUMB; j++) {
-        for (int i = 0; i < THUMB; i++) {
+    int b = cover_s / T;
+    for (int j = 0; j < T; j++) {
+        for (int i = 0; i < T; i++) {
             if (b < 2) {
-                dst[j * THUMB + i] = cover_pix[(j * cover_s / THUMB) * cover_s + (i * cover_s / THUMB)];
+                dst[j * T + i] = cover_pix[(j * cover_s / T) * cover_s + (i * cover_s / T)];
             } else {
                 int r = 0, g = 0, bl = 0;
                 for (int y = 0; y < b; y++)
@@ -2787,11 +2787,13 @@ static void make_thumb(u16 *dst)
                         r += p & 31; g += (p >> 5) & 31; bl += (p >> 10) & 31;
                     }
                 int n = b * b;
-                dst[j * THUMB + i] = (u16)(0x8000 | (r / n) | ((g / n) << 5) | ((bl / n) << 10));
+                dst[j * T + i] = (u16)(0x8000 | (r / n) | ((g / n) << 5) | ((bl / n) << 10));
             }
         }
     }
 }
+
+static void make_thumb(u16 *dst) { make_thumb_n(dst, THUMB); }
 
 // Load "icon.png" of the album that is playing (cached, so normally instant).
 static void load_cover(void)
@@ -5171,6 +5173,10 @@ static int sy_album(Jr *j)
             static char cp[420];
             snprintf(cp, sizeof cp, "%s", jr_str);
             if (!sy_entry(fo[0] ? fo : nm, root, cp, 0, "icon.png")) return 0;
+        } else if (!strcmp(key, "thumb") && v == J_STR) {
+            static char tp[420];
+            snprintf(tp, sizeof tp, "%s", jr_str);
+            if (sy_mode == 2 && !sy_entry(fo[0] ? fo : nm, root, tp, 0, "thumb.png")) return 0;
         } else if (!strcmp(key, "files") && v == J_LS) {
             int r = sy_files(j, fo[0] ? fo : nm, root);
             if (r <= 0) return r;
@@ -5259,10 +5265,12 @@ static int sy_wifi(void)
 #define OL_POOL (128 * 1024)
 
 typedef struct { unsigned po, no; long size; unsigned short album; unsigned char have; } OFile;
-typedef struct { unsigned fo, cover; unsigned short first, n, have_n; unsigned char root, cover_tried; } OAlb;
+#define OL_TH 20
+typedef struct { unsigned fo, cover, thumb; unsigned short first, n, have_n; unsigned char root, cover_tried, th_ok; } OAlb;
 
 static OFile    ofile[MAX_OF];
 static OAlb     oalb[MAX_OA];
+static u16      othumb[MAX_OA][OL_TH * OL_TH];
 static char     opool[OL_POOL];
 static unsigned opool_n = 1;                  // offset 0 = "none"
 static int      nof = 0, noa = 0, ol_trunc = 0;
@@ -5323,6 +5331,7 @@ static void ol_add(const char *folder, int root, const char *upath, long size, c
     }
     OAlb *a = &oalb[noa - 1];
     if (save_as && !strcmp(save_as, "icon.png")) { a->cover = ol_pool(upath); return; }
+    if (save_as && !strcmp(save_as, "thumb.png")) { a->thumb = ol_pool(upath); return; }
     if (nof >= MAX_OF) { ol_trunc = 1; return; }
     static char name[NAME_LEN], un[NAME_LEN];
     if (save_as && save_as[0]) sy_safe(name, sizeof name, save_as);
@@ -5393,10 +5402,15 @@ static void ol_row(int idx)
     char nm[NAME_LEN], shown[NAME_LEN + 4], r[32];
     if (ol_view == 0) {
         int all = oalb[idx].n > 0 && oalb[idx].have_n == oalb[idx].n;
-        draw_folder(11, y + 5, all ? C_GREEN : C_GREY);
+        int tx0 = 38;
+        if (oalb[idx].th_ok) {
+            for (int j = 0; j < OL_TH; j++)
+                for (int i = 0; i < OL_TH; i++) putpx(fbB, 8 + i, y + 2 + j, othumb[idx][j * OL_TH + i]);
+            tx0 = 34;
+        } else draw_folder(11, y + 5, all ? C_GREEN : C_GREY);
         ol_title(nm, sizeof nm, idx);
-        fit_text(shown, sizeof shown, &F_MD, nm, 150);
-        draw_text(fbB, &F_MD, 38, y + 4, shown, all ? C_GREEN : C_WHITE);
+        fit_text(shown, sizeof shown, &F_MD, nm, 154);
+        draw_text(fbB, &F_MD, tx0, y + 4, shown, all ? C_GREEN : C_WHITE);
         snprintf(r, sizeof r, "%d/%d", oalb[idx].have_n, oalb[idx].n);
         draw_text_right(fbB, &F_SM, 234, y + 6, r, all ? C_GREEN : C_DIM);
         tri_right(fbB, 240, y + 8, 5, 9, C_DIM);
@@ -5482,6 +5496,31 @@ static void ol_top(void)
     draw_text(fbT, &F_SM, 16, 150, "Tap to open / download   A = select", C_DIM);
     draw_text(fbT, &F_SM, 16, 163, "X = get all   B = back", C_DIM);
     draw_text_right(fbT, &F_SB, 240, 178, "made by koi", C_GREEN);
+}
+
+// small server-made covers (60x60, a few KB each) for the album list
+static void ol_load_thumbs(void)
+{
+    static char tmp[NAME_LEN * 3];
+    join_path(tmp, sizeof tmp, dirpath, ".koi_thumb.png");
+    int total = 0, done = 0;
+    for (int a = 0; a < noa; a++) if (oalb[a].thumb) total++;
+    for (int a = 0; a < noa && !sy_cancelled; a++) {
+        OAlb *al = &oalb[a];
+        if (!al->thumb) continue;
+        sy_screen("Loading covers", sy_host, "", "", total ? done * 1000 / total : 0, "Hold B to skip");
+        done++;
+        if (!sy_get(opool + al->thumb, tmp, 0)) continue;
+        pf = fopen(tmp, "rb");
+        if (!pf) continue;
+        cover_s = 0;
+        const char *e = png_read();
+        fclose(pf); pf = NULL;
+        if (!e && cover_s > 0) { make_thumb_n(othumb[a], OL_TH); al->th_ok = 1; }
+        cover_s = 0;
+    }
+    remove(tmp);
+    sy_cancelled = 0;
 }
 
 static void ol_redraw(void)
@@ -5645,6 +5684,7 @@ static void ol_run(void)
 
     for (int i = 0; i < nof; i++) ofile[i].have = (unsigned char)ol_have_file(i);
     ol_recount();
+    ol_load_thumbs();
     ol_redraw();
 
     int leave = 0;
